@@ -67,7 +67,7 @@
             "description": "Optional. Extra fields to show on hover.",
             "name": "tooltips",
             "displayNameKey": "Role_Tooltips",
-            "kind": "GroupingOrMeasure"
+            "kind": "Measure"
         },
         {
             "displayName": "Period",
@@ -759,6 +759,11 @@
                     "type": {
                         "text": true
                     }
+                },
+                "groupSlots": {
+                    "type": {
+                        "text": true
+                    }
                 }
             }
         },
@@ -772,7 +777,7 @@
             }
         }
     },
-    "supportsHighlight": true,
+    "supportsHighlight": false,
     "supportsMultiVisualSelection": true,
     "supportsKeyboardFocus": true,
     "supportsLandingPage": true,

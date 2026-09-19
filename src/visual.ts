@@ -142,6 +142,17 @@ export class Visual implements IVisual {
     private collapsedKeys = new Set<string>();
     /** The stored collapse value as last read from the host; null before the first. */
     private lastHostCollapsed: string | null = null;
+    /** A collapse value WE wrote that the host has not echoed back yet. */
+    private pendingCollapsed: string | null = null;
+    /** Bumped whenever the collapse set is replaced from outside (bookmark, undo),
+     *  so the view re-fits even when the counts happen to match. */
+    private collapseEpoch = 0;
+    /** True once this instance raised the warning icon, so a clean render can clear it. */
+    private warned = false;
+    /** Group value → colour slot. Assigned once, never reassigned (#2). */
+    private groupSlots = new Map<string, number>();
+    private pendingSlots: string | null = null;
+    private lastSlotsBlob = "";
     private lastOptions: VisualUpdateOptions | null = null;
     /** Annotations. Free since OC-016; the gate is kept but allows everything. */
     private notes = new NotesStore();
@@ -364,6 +375,7 @@ export class Visual implements IVisual {
 
             const model = buildOrgModel(dataView, this.license.nodeCap, this.host, this.loc.locale);
             this.maybeFetchMore(dataView);
+            this.syncGroupSlots(model, dataView, palette);
             if (model.nodes.length === 0) {
                 this.leaveAltViews();
                 this.renderLanding(EmptyReason.NoData, dataView, w, h, palette);
@@ -382,22 +394,30 @@ export class Visual implements IVisual {
             const parents = model.nodes.map((n) => n.parentKey);
             const hierarchy = buildHierarchy(keys, parents);
 
-            // Restore persisted collapse state, then reconcile with this render's
-            // indices. Keys are the contract; indices shift on every filter.
+            // Restore persisted collapse state. Keys are the contract; indices
+            // shift on every filter.
             //
-            // Only a value the host has CHANGED is restored (OC-029). Expanding the
-            // last collapsed branch empties the set and re-renders from the same
-            // (stale) options before the host echoes the write — and "empty set +
-            // a stored value" used to restore that stored value, so the branch
-            // snapped shut again. The + did nothing, and search-and-jump or "show
-            // on the chart" into that branch landed on a card that wasn't drawn.
+            // The stored value is the report's; the in-memory set is ours between
+            // a write and its echo. Three cases (zentrix-org-chart#3, OC-QA-34):
+            //   • it equals our unconfirmed write → the host confirmed it;
+            //   • it equals what we last saw     → nothing happened (or a stale
+            //     update raced our write — ignoring it is what OC-029 fixed);
+            //   • anything else                  → it changed from OUTSIDE: a
+            //     bookmark, Undo, a copy/paste, another author's save. Replace the
+            //     set with it. Before this, an external value was only read while
+            //     the set was empty, so after the first toggle bookmarks never
+            //     restored collapse.
             const persisted = this.settings.layout.collapsed.value || "";
-            if (persisted !== this.lastHostCollapsed) {
+            if (this.pendingCollapsed !== null && persisted === this.pendingCollapsed) {
+                this.pendingCollapsed = null;
                 this.lastHostCollapsed = persisted;
-                if (this.collapsedKeys.size === 0 && persisted) {
-                    const restored = deserializeCollapsed(keys, persisted);
-                    restored.forEach((i) => this.collapsedKeys.add(keys[i]));
-                }
+            } else if (persisted !== this.lastHostCollapsed
+                && !(this.pendingCollapsed !== null && this.lastHostCollapsed === null)) {
+                const external = this.lastHostCollapsed !== null;
+                this.lastHostCollapsed = persisted;
+                this.pendingCollapsed = null;
+                this.collapsedKeys = new Set(collapsedKeysOf(persisted));
+                if (external) this.collapseEpoch++;
             }
 
             // The view switch is placed BEFORE the chart is fitted: the fit, the
@@ -519,7 +539,7 @@ export class Visual implements IVisual {
                 this.settings.layout.fillViewport.value, layoutOptions.levelGap,
                 this.settings.nodes.sizeMode.value.value,
                 // Stacking and wrapping change the picture without changing the counts above.
-                layoutOptions.leafStack ?? 0, layoutOptions.rootsPerRow ?? 0,
+                layoutOptions.leafStack ?? 0, layoutOptions.rootsPerRow ?? 0, this.collapseEpoch,
                 this.settings.labels.nameSize.value, this.settings.labels.titleSize.value,
                 // Chrome the fit steers around: moving or hiding it changes the fit.
                 this.settings.overlays.showSearch.value, this.settings.toolbar.show.value,
@@ -660,11 +680,16 @@ export class Visual implements IVisual {
                 const mode = String(this.settings.colors.colorMode.value.value);
                 let items: LegendItem[] = [];
                 if (mode === "group") {
-                    items = model.groups.map((gname, gi) => ({
-                        label: gname,
-                        color: palette.groupColor(gi, gname),
-                        dash: palette.groupDash(gi),
-                    }));
+                    // In slot order, so a filter can drop a legend entry but never
+                    // reorder or recolour the others (#2).
+                    items = model.groups
+                        .map((gname) => ({ gname, slot: this.groupSlots.get(gname) ?? 0 }))
+                        .sort((a, b) => a.slot - b.slot)
+                        .map(({ gname, slot }) => ({
+                            label: gname,
+                            color: this.slotColor(palette, slot),
+                            dash: palette.groupDash(slot),
+                        }));
                 } else {
                     const depths = Array.from(new Set(hierarchy.depth
                         .filter((_d, i) => !hidden.has(i)))).sort((a, b) => a - b);
@@ -875,23 +900,77 @@ export class Visual implements IVisual {
     } {
         const colorMode = this.settings.colors.colorMode.value.value as ColorMode;
         const single = this.settings.colors.cardFill.value.value || accentStrong;
-        const groupIdx = new Map<string, number>();
-        model.groups.forEach((g, i) => groupIdx.set(g, i));
+        const slotOf = (g: string): number => this.groupSlots.get(g) ?? 0;
         const colorOf = (i: number): string => {
             if (palette.highContrast) return palette.groupColor(0);
             if (colorMode === "single") return single;
             if (colorMode === "level") return palette.groupColor(hierarchy.depth[i], `level-${hierarchy.depth[i]}`);
             const g = model.nodes[i].group;
-            return g === null ? single : palette.groupColor(groupIdx.get(g) ?? 0, g);
+            return g === null ? single : this.slotColor(palette, slotOf(g));
         };
         // High contrast encodes groups by DASH, never colour.
         const dashOf = (i: number): string => {
             if (!palette.highContrast) return "";
             if (colorMode === "level") return palette.groupDash(hierarchy.depth[i]);
             const g = model.nodes[i].group;
-            return g === null ? "" : palette.groupDash(groupIdx.get(g) ?? 0);
+            return g === null ? "" : palette.groupDash(slotOf(g));
         };
         return { colorOf, dashOf };
+    }
+
+    /**
+     * A group's colour, by its SLOT — never by where it first appears in the rows.
+     *
+     * zentrix-org-chart#2 (OC-QA-12): excluding one person or re-sorting recoloured
+     * six of eight groups, WITH the report theme on. 13c already asked the host for
+     * `getColor(groupValue)`, so the host's palette is not stable across a filter in
+     * Desktop (Microsoft documents no stability contract for it). The visual owns the
+     * assignment instead: a value keeps its slot for good (`groupSlots`, persisted),
+     * and with the theme on the host is asked for the SLOT keys in slot order every
+     * render, so whatever the host's allocation policy, slot n is always the same
+     * theme colour.
+     */
+    private slotColor(palette: ResolvedPalette, slot: number): string {
+        return palette.groupColor(slot, `zx-slot-${slot}`);
+    }
+
+    /** Give every group a slot: stored ones first, then new values in first-seen
+     *  order at the next free slot. Existing slots never move. */
+    private syncGroupSlots(model: OrgModel, dataView: DataView | undefined, palette: ResolvedPalette): void {
+        const obj = (dataView?.metadata?.objects as { colorStore?: { groupSlots?: unknown } } | undefined)?.colorStore;
+        const stored = typeof obj?.groupSlots === "string" ? obj.groupSlots : "";
+        if (this.pendingSlots !== null && stored === this.pendingSlots) this.pendingSlots = null;
+        if (this.pendingSlots === null && stored !== this.lastSlotsBlob) {
+            // The report's map wins (a bookmark, Undo, another author's save);
+            // anything only this session knew about is kept after it.
+            const parsed = parseSlots(stored);
+            if (parsed.size) {
+                for (const [g, s] of this.groupSlots) if (!parsed.has(g)) parsed.set(g, nextFree(parsed, s));
+                this.groupSlots = parsed;
+            }
+            this.lastSlotsBlob = stored;
+        }
+        let added = false;
+        for (const g of model.groups) {
+            if (!this.groupSlots.has(g)) { this.groupSlots.set(g, nextFree(this.groupSlots)); added = true; }
+        }
+        // Theme on: request the slot keys in slot order, so the host hands out its
+        // colours in the same order on every render.
+        if (!palette.highContrast && this.settings.colors.useReportTheme.value) {
+            let max = -1;
+            this.groupSlots.forEach((s) => { if (s > max) max = s; });
+            for (let s = 0; s <= max; s++) this.slotColor(palette, s);
+        }
+        if (added && this.groupSlots.size <= MAX_STORED_SLOTS) {
+            const blob = JSON.stringify(Array.from(this.groupSlots.entries()).sort((a, b) => a[1] - b[1]));
+            if (blob !== this.lastSlotsBlob) {
+                this.lastSlotsBlob = blob;
+                this.pendingSlots = blob;
+                this.host.persistProperties({
+                    merge: [{ objectName: "colorStore", selector: null, properties: { groupSlots: blob } }],
+                } as powerbi.VisualObjectInstancesToPersist);
+            }
+        }
     }
 
     /**
@@ -1209,10 +1288,21 @@ export class Visual implements IVisual {
             { duplicateRows: model.duplicateRows, keylessRows: model.keylessRows },
         );
         const warning = buildWarning(q);
-        if (!warning) return;
         if (typeof this.host.displayWarningIcon !== "function") return;
         try {
-            this.host.displayWarningIcon(warning.title, warning.detail);
+            if (warning) {
+                this.host.displayWarningIcon(warning.title, warning.detail);
+                this.warned = true;
+            } else if (this.warned) {
+                // zentrix-org-chart#8 (OC-QA-35). Microsoft documents that the host
+                // clears the icon "during each rendering of the visual"; in Desktop
+                // a filter that makes the data clean did NOT clear it. API 5.11 has
+                // no clear call, so the only lever is an empty warning — sent once,
+                // on the warned → clean transition, never on an ordinary render.
+                // Host-verified only; see the 1.0.0.0-20260920b handoff.
+                this.host.displayWarningIcon("", "");
+                this.warned = false;
+            }
         } catch {
             // An older host without the API must not break the render.
         }
@@ -1233,6 +1323,7 @@ export class Visual implements IVisual {
             collapsed: serializeCollapsed(keys, idx),
         };
         if (markAutoDone) properties.collapseToFitDone = true;
+        this.pendingCollapsed = properties.collapsed as string;
         this.host.persistProperties({
             merge: [{
                 objectName: "layout",
@@ -1813,4 +1904,41 @@ function parseTableState(blob: string): TableState | null {
         }
     } catch { /* malformed → defaults */ }
     return null;
+}
+
+/** Beyond this many distinct groups the slot map lives in memory only — a Group
+ *  bound to a unique column must not write a megabyte into the report. */
+const MAX_STORED_SLOTS = 500;
+
+function parseSlots(blob: string): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!blob) return out;
+    try {
+        const arr = JSON.parse(blob) as unknown;
+        if (Array.isArray(arr)) {
+            for (const e of arr) {
+                if (Array.isArray(e) && typeof e[0] === "string" && typeof e[1] === "number" && isFinite(e[1]) && e[1] >= 0) {
+                    out.set(e[0], Math.floor(e[1]));
+                }
+            }
+        }
+    } catch { /* malformed → no stored map */ }
+    return out;
+}
+
+/** The lowest slot no group holds (at or after `from`). */
+function nextFree(map: Map<string, number>, from = 0): number {
+    const used = new Set(map.values());
+    let s = Math.max(0, from);
+    while (used.has(s)) s++;
+    return s;
+}
+
+/** Keys from a stored collapse value, whether or not they are in this render's rows. */
+function collapsedKeysOf(raw: string): string[] {
+    if (!raw) return [];
+    try {
+        const arr = JSON.parse(raw) as unknown;
+        return Array.isArray(arr) ? arr.filter((k): k is string => typeof k === "string") : [];
+    } catch { return []; }
 }

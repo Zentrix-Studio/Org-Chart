@@ -456,7 +456,7 @@ export const PAGES: PageDefinition[] = [
             "• A manager's direct reports stack into columns when one row would be too wide to read. Leaf reports: Auto, Row or Stacked.",
             "• Nothing opens with a name smaller than 9 px. If the whole chart won't fit at that size, it opens collapsed to the levels that do, each with a count of what's folded away.",
             "• Zoom out with − or the wheel to see all of it. Fit and search bring you back to a readable size, and a note says when part of the chart is off screen.",
-            "• Collapse is stored by key, not by row position, so a filter, a re-sort or a refresh cannot lose it.",
+            "• Collapse is stored by key, not by row position, so a filter, a re-sort or a refresh cannot lose it — and a bookmark or Undo brings it back.",
         ],
     },
     {
