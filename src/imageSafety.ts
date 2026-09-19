@@ -15,14 +15,20 @@
 
 const DATA_URI = /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,([A-Za-z0-9+/]+={0,2})$/i;
 
-/** Longest photo payload we will accept (~1.5 MB of base64). */
-const MAX_LENGTH = 2_000_000;
+/**
+ * Power BI caps a text value at 32,766 characters and cuts anything longer off
+ * without saying so (zentrix-org-chart#11, OC-QA-32). A cut PNG still passes the
+ * pattern above and the browser paints the part it can decode — a grey
+ * half-image. A value that long is treated as truncated and rejected, so the card
+ * shows its fallback instead. A genuine photo has to fit under the cap anyway.
+ */
+export const POWER_BI_TEXT_CAP = 32_766;
 
 /** Returns a safe data URI, or null when the value cannot be trusted. */
 export function safeImageDataUri(value: unknown): string | null {
     if (value === null || value === undefined) return null;
     const s = String(value).trim();
-    if (s.length === 0 || s.length > MAX_LENGTH) return null;
+    if (s.length === 0 || s.length >= POWER_BI_TEXT_CAP) return null;
     // Reject anything with whitespace or control characters inside the payload.
     if (/\s/.test(s)) return null;
     return DATA_URI.test(s) ? s : null;

@@ -63,3 +63,18 @@ svg.zentrix-org {
         transition: none;
     }
 }
+
+// zentrix-org-chart#5 (OC-QA-30): an exported or printed page shows the chart, not
+// the visual's own controls. `zx-exporting` is set for the Service's export host
+// and around a print; the media query covers a print path that does neither.
+.zentrix-org-root.zx-exporting,
+.zentrix-org-root.zx-printing {
+    .zsb-anchor, .zx-search, .zx-view, .zx-lp { display: none !important; }
+    svg.zentrix-org .zoom-controls, svg.zentrix-org .pan-hint { display: none !important; }
+}
+@media print {
+    .zentrix-org-root {
+        .zsb-anchor, .zx-search, .zx-view { display: none !important; }
+        svg.zentrix-org .zoom-controls, svg.zentrix-org .pan-hint { display: none !important; }
+    }
+}

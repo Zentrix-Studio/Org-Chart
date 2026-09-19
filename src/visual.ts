@@ -92,6 +92,25 @@ export class Visual implements IVisual {
     private tooltipWrapper: ITooltipServiceWrapper | null = null;
     /** False on non-interactive surfaces such as dashboard tiles. */
     private allowInteractions = true;
+    /** Rendering for an export / dashboard host: no chrome, fitted (#5). */
+    private exporting = false;
+    /** Photo data URI → decoded ("ok"), not an image ("bad"), or still probing (#10). */
+    private photoStatus = new Map<string, "ok" | "bad" | "pending">();
+    /** An update whose renderingFinished waits for photos still decoding. */
+    private finishAfterPhotos: VisualUpdateOptions | null = null;
+    /** True while the photo callback re-draws a render that has already started. */
+    private redrawing = false;
+    /** True while probes are being started — a probe that answers at once must not re-enter update(). */
+    private probing = false;
+    /** Set by destroy(): late photo answers must not draw or raise rendering events. */
+    private destroyed = false;
+    private readonly onBeforePrint = (): void => {
+        if (this.root) this.root.classList.add("zx-printing");
+        this.refit();
+    };
+    private readonly onAfterPrint = (): void => {
+        if (this.root) this.root.classList.remove("zx-printing");
+    };
     private palette: ResolvedPalette | null = null;
     /** Node index that currently has keyboard focus. */
     private focusIndex = -1;
@@ -194,12 +213,25 @@ export class Visual implements IVisual {
         this.allowInteractions =
             (options.host as unknown as { hostCapabilities?: { allowInteractions?: boolean } })
                 .hostCapabilities?.allowInteractions !== false;
+        // zentrix-org-chart#5 (OC-QA-30). The Service renders exports in its own host
+        // (`CustomVisualHostEnv.ExportReportHost`, API 5.11), and a dashboard tile is
+        // no place for controls either: both draw the chart with no chrome at all.
+        const env = Number((options.host as unknown as { hostEnv?: unknown }).hostEnv) || 0;
+        this.exporting = (env & (HOST_ENV_EXPORT | HOST_ENV_DASHBOARD)) !== 0;
+        if (this.exporting) this.allowInteractions = false;
         this.license = new LicenseGate(options.host, () => {
             if (this.lastOptions) this.update(this.lastOptions);
         });
 
-        const root = select(options.element).append("div").classed("zentrix-org-root", true);
+        const root = select(options.element).append("div").classed("zentrix-org-root", true)
+            .classed("zx-exporting", this.exporting);
         this.root = root.node() as HTMLElement;
+        // A print (Desktop's PDF export may be one) gets the fitted chart and no
+        // controls — not the reader's pan and a half-typed search (#5).
+        try {
+            window.addEventListener("beforeprint", this.onBeforePrint);
+            window.addEventListener("afterprint", this.onAfterPrint);
+        } catch { /* a host without print events */ }
         this.svg = root.append("svg").classed("zentrix-org", true) as SvgSel;
         // Bookmarks: Power BI calls back with the restored selection.
         bindBookmarks(this.selectionManager, () => {
@@ -322,8 +354,15 @@ export class Visual implements IVisual {
     }
 
     public update(options: VisualUpdateOptions): void {
+        // A render still waiting on photos is superseded: close its event first,
+        // so every renderingStarted has exactly one renderingFinished.
+        if (this.finishAfterPhotos) {
+            const prev = this.finishAfterPhotos;
+            this.finishAfterPhotos = null;
+            this.events.renderingFinished(prev);
+        }
         this.lastOptions = options;
-        this.events.renderingStarted(options);
+        if (!this.redrawing) this.events.renderingStarted(options);
         try {
             const dataView: DataView | undefined = options.dataViews && options.dataViews[0];
             this.settings = this.formattingSettingsService.populateFormattingSettingsModel(
@@ -368,19 +407,20 @@ export class Visual implements IVisual {
                 // is a different state and must NOT bring the carousel back.
                 this.setLandingVisible(reason === EmptyReason.NoData, palette.surface);
                 this.syncOverlay(w, h);
-                this.events.renderingFinished(options);
+                this.finish(options);
                 return;
             }
             this.setLandingVisible(false, palette.surface);
 
             const model = buildOrgModel(dataView, this.license.nodeCap, this.host, this.loc.locale);
             this.maybeFetchMore(dataView);
+            if (this.settings.nodes.showPhoto.value) this.probePhotos(model);
             this.syncGroupSlots(model, dataView, palette);
             if (model.nodes.length === 0) {
                 this.leaveAltViews();
                 this.renderLanding(EmptyReason.NoData, dataView, w, h, palette);
                 this.syncOverlay(w, h);
-                this.events.renderingFinished(options);
+                this.finish(options);
                 return;
             }
 
@@ -428,7 +468,7 @@ export class Visual implements IVisual {
             if (this.viewMode !== "chart") {
                 this.renderAltView(model, hierarchy, palette);
                 this.reportDataQuality(model, hierarchy, keys, parents);
-                this.events.renderingFinished(options);
+                this.finish(options);
                 return;
             }
             this.removeAltView();
@@ -633,6 +673,7 @@ export class Visual implements IVisual {
                 cardHeight: this.settings.nodes.cardHeight.value,
                 cornerRadius: this.settings.nodes.cornerRadius.value,
                 showPhoto: this.settings.nodes.showPhoto.value,
+                photoOk: (uri: string) => this.photoStatus.get(uri) === "ok",
                 photoShape: String(this.settings.nodes.photoShape.value.value) as PhotoShape,
                 photoSize: this.settings.nodes.photoSize.value,
                 photoRing: this.settings.nodes.photoRing.value,
@@ -743,7 +784,7 @@ export class Visual implements IVisual {
             this.renderPanHint(w, h, surface.muted);
             this.syncOverlay(w, h);
             this.reportDataQuality(model, hierarchy, keys, parents);
-            this.events.renderingFinished(options);
+            this.finish(options);
         } catch (e) {
             this.events.renderingFailed(options, String(e));
         }
@@ -1379,6 +1420,74 @@ export class Visual implements IVisual {
     }
 
     /**
+     * Report the render finished — unless photos are still decoding, in which case
+     * the probe callback re-draws and finishes. An export captures the page at
+     * renderingFinished, so it must never be the frame with a placeholder in it.
+     */
+    private finish(options: VisualUpdateOptions): void {
+        for (const st of this.photoStatus.values()) {
+            if (st === "pending") { this.finishAfterPhotos = options; return; }
+        }
+        this.events.renderingFinished(options);
+    }
+
+    /**
+     * Decode each distinct photo once (zentrix-org-chart#10, OC-QA-31). A data URI
+     * never touches the network, so this stays inside certification. A payload that
+     * is valid base64 but not an image fails here and the card gets its fallback,
+     * instead of the browser's broken-image glyph.
+     */
+    private probePhotos(model: OrgModel): void {
+        const Img = (typeof Image === "function" ? Image : null) as (new () => HTMLImageElement) | null;
+        this.probing = true;
+        try { this.startProbes(model, Img); } finally { this.probing = false; }
+    }
+
+    private startProbes(model: OrgModel, Img: (new () => HTMLImageElement) | null): void {
+        for (const n of model.nodes) {
+            const uri = n.photo;
+            if (!uri || this.photoStatus.has(uri)) continue;
+            if (!Img) { this.photoStatus.set(uri, "ok"); continue; }
+            this.photoStatus.set(uri, "pending");
+            try {
+                const img = new Img();
+                const settle = (ok: boolean): void => {
+                    if (this.photoStatus.get(uri) !== "pending") return;
+                    this.photoStatus.set(uri, ok && img.naturalWidth > 0 ? "ok" : "bad");
+                    if (!this.probing) this.onPhotoSettled();
+                };
+                img.onload = () => settle(true);
+                img.onerror = () => settle(false);
+                img.src = uri;
+            } catch {
+                this.photoStatus.set(uri, "bad");
+            }
+        }
+    }
+
+    /** Once every probe has settled, draw again with the answers and finish. */
+    private onPhotoSettled(): void {
+        if (this.destroyed) return;
+        for (const st of this.photoStatus.values()) if (st === "pending") return;
+        const waiting = this.finishAfterPhotos;
+        this.finishAfterPhotos = null;
+        if (waiting) {
+            // Re-enter the draw WITHOUT a new renderingStarted: this is the same
+            // render, still open, and this pass closes it.
+            this.redraw(waiting);
+        } else if (this.lastOptions) {
+            // That render was already closed by a newer update — this one is our
+            // own, so it gets its own started / finished pair (G12-a chaos gate).
+            this.update(this.lastOptions);
+        }
+    }
+
+    private redraw(options: VisualUpdateOptions): void {
+        this.redrawing = true;
+        try { this.update(options); } finally { this.redrawing = false; }
+    }
+
+    /**
      * Put the search box in the top row, clear of a gear pinned top-left and of
      * the view switch. Idempotent: called before the fit so the fit can steer
      * around it, and the box keeps its state across renders.
@@ -1457,7 +1566,8 @@ export class Visual implements IVisual {
             || b.minY * t.k + t.ty < -1
             || b.maxX * t.k + t.tx > this.lastFit.width + 1
             || b.maxY * t.k + t.ty > this.lastFit.height + 1;
-        hint.attr("opacity", cropped ? 1 : 0);
+        // A surface that cannot be panned (a dashboard tile, an export) is not told to pan.
+        hint.attr("opacity", cropped && this.allowInteractions ? 1 : 0);
         // While the view is a crop, the pan notice is the more urgent sentence and
         // takes the status line's place; fitting brings the status line back.
         this.chrome.selectAll<SVGTextElement, unknown>("text.status-line").attr("opacity", cropped ? 0 : 1);
@@ -1876,6 +1986,20 @@ export class Visual implements IVisual {
         }
     }
 
+    /**
+     * Power BI rarely calls this (it drops the iframe), but when it does, nothing
+     * asynchronous may outlive the instance: a photo that finishes decoding later
+     * must not draw into a dead visual or report a render nobody started.
+     */
+    public destroy(): void {
+        this.destroyed = true;
+        this.finishAfterPhotos = null;
+        try {
+            window.removeEventListener("beforeprint", this.onBeforePrint);
+            window.removeEventListener("afterprint", this.onAfterPrint);
+        } catch { /* nothing to remove */ }
+    }
+
     public getFormattingModel(): powerbi.visuals.FormattingModel {
         // The accent colour only paints a card in "One" mode (and behind anyone
         // with no group), so in Group / Level mode it is hidden rather than left
@@ -1942,3 +2066,7 @@ function collapsedKeysOf(raw: string): string[] {
         return Array.isArray(arr) ? arr.filter((k): k is string => typeof k === "string") : [];
     } catch { return []; }
 }
+
+/** `CustomVisualHostEnv` bits (powerbi-visuals-api 5.11): ExportReportHost, DashboardHost. */
+const HOST_ENV_EXPORT = 1 << 5;
+const HOST_ENV_DASHBOARD = 1 << 7;

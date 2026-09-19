@@ -65,6 +65,13 @@ export interface RenderOptions {
     photoRingWidth: number;
     /** What a row with no photo gets. `none` reserves no space at all. */
     photoFallback: PhotoFallback;
+    /**
+     * Whether a photo actually decodes (zentrix-org-chart#10). A value can pass
+     * `imageSafety` and still not be an image — PH30 is valid base64 of the text
+     * "notanimage" — and the browser then draws its broken-image glyph. Unknown or
+     * bad photos get the fallback. Omitted: every safe photo is drawn (tests).
+     */
+    photoOk?: (uri: string) => boolean;
     showMeasure: boolean;
     showTitle: boolean;
     nameSize: number;
@@ -344,7 +351,8 @@ export function renderTree(
         return Math.max(0, Math.min(wanted, (H(i) - 4 * scale(i)) / 2, W(i) / 3));
     };
     /** A real picture is present and photos are on. */
-    const hasImage = (i: number): boolean => opts.showPhoto && !!nodes[i].photo;
+    const hasImage = (i: number): boolean => opts.showPhoto && !!nodes[i].photo
+        && (!opts.photoOk || opts.photoOk(nodes[i].photo as string));
     /**
      * Space is reserved for an avatar. With `none`, a row without a picture
      * reserves nothing and its text slides left — which is the behaviour that
@@ -352,7 +360,7 @@ export function renderTree(
      * places, so it is no longer the default.
      */
     const hasAvatar = (i: number): boolean =>
-        opts.showPhoto && (!!nodes[i].photo || opts.photoFallback !== "none");
+        opts.showPhoto && (hasImage(i) || opts.photoFallback !== "none");
     const ringColor = (i: number): string =>
         opts.highContrast ? opts.surface.fg : (opts.photoRingColor || opts.colorOf(i));
     /**
@@ -500,7 +508,9 @@ export function renderTree(
         .attr("preserveAspectRatio", "xMidYMid slice")
         // THE FIX: without this the image drew as a square over the outline.
         .attr("clip-path", (i) => `url(#${clipId(i)})`)
-        .attr("href", (i) => nodes[i].photo || "")
+        // Never hand the browser a photo that has not decoded: that is where the
+        // broken-image glyph came from.
+        .attr("href", (i) => (hasImage(i) ? (nodes[i].photo as string) : ""))
         .attr("opacity", (i) => (hasImage(i) ? 1 : 0));
 
     const initialsShown = (i: number): boolean =>
