@@ -1,0 +1,45 @@
+{
+  "name": "zentrix-org-chart",
+  "description": "Power BI custom visual — parent-child hierarchy / org chart with permissive roots and persistent collapse state.",
+  "version": "1.0.0.0",
+  "license": "MIT",
+  "scripts": {
+    "pbiviz": "pbiviz",
+    "start": "pbiviz start",
+    "package": "pbiviz package",
+    "audit": "npm audit --audit-level=low",
+    "lint": "eslint . --max-warnings=0",
+    "eslint": "npx eslint . --ext .js,.jsx,.ts,.tsx",
+    "test": "jest",
+    "typecheck": "tsc --noEmit -p tsconfig.spec.json",
+    "shared:check": "node scripts/sync-shared.mjs --check",
+    "shared:sync": "node scripts/sync-shared.mjs"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.65.0",
+    "esbuild": "^0.28.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-powerbi-visuals": "^1.1.1",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "powerbi-visuals-tools": "^7.2.1",
+    "ts-jest": "^29.4.12",
+    "typescript": "5.5.4"
+  },
+  "dependencies": {
+    "d3": "^7.9.0",
+    "powerbi-visuals-api": "^5.11.1",
+    "powerbi-visuals-utils-formattingmodel": "^6.2.2",
+    "powerbi-visuals-utils-tooltiputils": "^6.0.4"
+  },
+  "overrides": {
+    "minimatch": "10.2.6",
+    "test-exclude": "8.0.0",
+    "sockjs": {
+      "uuid": "11.1.1"
+    }
+  }
+}
