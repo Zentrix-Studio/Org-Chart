@@ -503,6 +503,9 @@ interface LandingActions {
     onLinkedIn?: () => void;
 }
 
+/** Below this width OR height the carousel becomes the mini card (#16, OC-QA-29). */
+export const MINI_PX = 260;
+
 export class LandingPage {
     private root: HTMLElement;
     private host?: HTMLElement;
@@ -512,6 +515,8 @@ export class LandingPage {
         cardFill: "#FFFFFF", cardStroke: "#E1E1EC", connector: "#C9C9D8",
     };
     private cleanups: Cleanup[] = [];
+    /** Below MINI_PX in either direction the deck is replaced by the mini card (#16). */
+    private mini = false;
 
     constructor(root: HTMLElement, private actions: LandingActions = {}) {
         this.root = root;
@@ -588,10 +593,16 @@ export class LandingPage {
         const h = height ?? this.root.clientHeight;
         let size = "full";
         if (w > 0 && h > 0) {
-            if (w < 300 || h < 220) size = "tiny";
+            if (w < MINI_PX || h < MINI_PX) size = "mini";
+            else if (w < 300 || h < 220) size = "tiny";
             else if (w < 560 || h < 400) size = "compact";
         }
         this.host.setAttribute("data-size", size);
+        // zentrix-org-chart#16 (OC-QA-29): at ~190×190 the carousel cut its headline
+        // mid-sentence and lost its pager. A tile that small cannot hold a deck, so it
+        // gets the one thing it needs to say instead — the mini card.
+        const mini = size === "mini";
+        if (mini !== this.mini) { this.mini = mini; this.render(); }
         // The gear floats over the deck's top-right corner whenever the visual
         // shows it (it stands down below 220×160 — `syncOverlay`). On a tile the
         // title runs up into that corner, so keep it clear there.
@@ -606,6 +617,25 @@ export class LandingPage {
             this.host.remove();
             this.host = undefined;
         }
+    }
+
+    /** The mini card: logo, the ask, and the two wells the chart cannot draw without. */
+    private renderMini(host: HTMLElement): void {
+        const card = el("div", "zx-lp-card zx-lp-mini");
+        const brand = el("div", "zx-lp-brand");
+        brand.appendChild(zentrixMark(isDark(this.surface.bg)));
+        brand.appendChild(textEl("span", "zx-lp-mini-name", "Org Chart"));
+        card.appendChild(brand);
+        card.appendChild(textEl("div", "zx-lp-mini-ask", "Add Person ID and Reports to"));
+        const list = el("div", "zx-lp-mini-wells");
+        for (const well of ["Person ID *", "Reports to *"]) {
+            const row = el("div", "zx-lp-mini-well");
+            row.appendChild(textEl("span", "zx-lp-mini-box", ""));
+            row.appendChild(textEl("span", "zx-lp-mini-label", well));
+            list.appendChild(row);
+        }
+        card.appendChild(list);
+        host.appendChild(card);
     }
 
     private applyTheme(): void {
@@ -628,6 +658,7 @@ export class LandingPage {
         if (!this.host) return;
         const host = this.host;
         while (host.firstChild) host.removeChild(host.firstChild);
+        if (this.mini) { this.renderMini(host); return; }
         const page = PAGES[this.page];
         const context: SceneContext = { dark: isDark(this.surface.bg), surface: this.surface };
 
@@ -793,6 +824,15 @@ const LANDING_CSS = `
   padding:26px 30px 18px;box-sizing:border-box;overflow:hidden;}
 @media (max-width:560px){.zx-lp-art{display:none}.zx-lp-content{flex:1 1 100%}}
 .zx-lp[data-size="compact"],.zx-lp[data-size="tiny"]{padding:8px;}
+.zx-lp[data-size="mini"]{padding:6px;}
+.zx-lp-mini{flex-direction:column;align-items:flex-start;justify-content:center;gap:6px;padding:10px 12px;border-radius:10px;box-shadow:none;overflow:hidden;}
+.zx-lp-mini .zx-lp-brand{margin:0;gap:6px;}
+.zx-lp-mini .zx-zentrix-mark{width:16px;height:16px;}
+.zx-lp-mini-name{font-size:11px;font-weight:700;color:var(--lp-muted);letter-spacing:.3px;}
+.zx-lp-mini-ask{font-size:13px;font-weight:700;line-height:1.25;color:var(--lp-fg);}
+.zx-lp-mini-wells{display:flex;flex-direction:column;gap:4px;}
+.zx-lp-mini-well{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--lp-fg);white-space:nowrap;}
+.zx-lp-mini-box{width:10px;height:10px;border:1.5px solid var(--lp-muted);border-radius:3px;flex:0 0 auto;}
 .zx-lp[data-size="compact"] .zx-lp-art,.zx-lp[data-size="tiny"] .zx-lp-art{display:none;}
 .zx-lp[data-size="compact"] .zx-lp-content,.zx-lp[data-size="tiny"] .zx-lp-content{flex:1 1 100%;}
 .zx-lp[data-size="compact"] .zx-lp-card{border-radius:14px;}

@@ -19,7 +19,7 @@ import { VisualFormattingSettingsModel } from "../settings";
 import { ZentrixSettingsBar } from "./zentrixSettingsBar";
 import {
     SB_CATS, SB_FONTS, SB_PALETTES, SB_PRESETS, SB_EMOJI,
-    makeCfg, applyLocal, readLocal, PersistWrite,
+    makeCfg, applyLocal, readLocal, settingKeys, PersistWrite,
 } from "./settingsSchema";
 
 type Model = VisualFormattingSettingsModel;
@@ -50,6 +50,15 @@ export class SettingsOverlay {
     /** Optimistic edits not yet confirmed by a host round-trip. Replayed onto each
      *  freshly populated model so a stale update() cannot revert the canvas. */
     private pending = new Map<string, unknown>();
+    /**
+     * The picker's preset row. The bar keeps its options by reference and reads
+     * `presets` each time a picker opens, so this array is refreshed IN PLACE: the
+     * report theme's colours when "Use report theme" is on, the Zentrix eight
+     * otherwise (zentrix-org-chart#15, OC-QA-28).
+     */
+    private presets: string[] = [...SB_PRESETS];
+    /** Every gear key's value as of the last update — what the open panel shows. */
+    private shown = new Map<string, string>();
 
     /**
      * @param onReset fired after a Reset, so the visual can drop the view state it
@@ -86,7 +95,7 @@ export class SettingsOverlay {
 
         this.bar = new ZentrixSettingsBar(root, {
             cfg, cats: SB_CATS, fonts: SB_FONTS, palettes: SB_PALETTES,
-            presets: SB_PRESETS, emoji: SB_EMOJI,
+            presets: this.presets, emoji: SB_EMOJI,
             corner: "bl", dark: false, closeOnAway: true,
         });
     }
@@ -111,11 +120,64 @@ export class SettingsOverlay {
 
     update(s: Model, dark: boolean, forceHidden = false): void {
         this.reconcile(s);
+        this.refreshPresets(s);
+        this.refreshIfChangedOutside(s);
         this.applyTheme(dark);
         this.bar.setVisible(s.toolbar.show.value && !forceHidden);
         this.bar.setCloseOnAway(s.toolbar.closeOnClickAway.value);
         this.pref = (s.toolbar.position.value.value as string) || "auto";
         if (this.pref !== "auto") this.bar.setCorner(this.pref);
+    }
+
+    /**
+     * zentrix-org-chart#12 (OC-QA-23): with the gear open on Width 120, the author
+     * set 200 in the Format pane; the gear still said 120 and its "+" wrote 124,
+     * throwing the 200 away. The shared bar draws a panel once and its steppers keep
+     * the value they were drawn with (an engine defect, logged for the family: CEO
+     * call 2026-09-20 was to fix it in THIS visual's wrapper, not in mirrored code).
+     *
+     * So: when a value the panel shows changes from OUTSIDE — not one of our own
+     * unconfirmed edits — the open panel is re-drawn from the live model, which
+     * rebuilds every stepper on the current value. The bar's own refresh keeps the
+     * pane, focus and caret, and defers while a control is being dragged.
+     */
+    private refreshIfChangedOutside(s: Model): void {
+        let external = false;
+        for (const key of settingKeys()) {
+            const now = String(readLocal(s, key));
+            const before = this.shown.get(key);
+            if (before !== undefined && before !== now && !this.pending.has(key)) external = true;
+            this.shown.set(key, now);
+        }
+        if (!external || !this.bar.isOpen()) return;
+        const bar = this.bar as unknown as { refreshActiveDetail?: () => void };
+        if (typeof bar.refreshActiveDetail === "function") {
+            try { bar.refreshActiveDetail(); } catch { /* a refresh must never break the render */ }
+        }
+    }
+
+    /**
+     * The same keys the chart asks the host for its group colours (`zx-slot-n`, in
+     * slot order — see Visual.slotColor), so preset n is the colour group slot n
+     * is drawn in. High contrast keeps the fixed row: its colours are not the
+     * theme's to offer.
+     */
+    private refreshPresets(s: Model): void {
+        const palette = this.host.colorPalette as unknown as {
+            isHighContrast?: boolean; getColor?: (k: string) => { value?: string };
+        } | undefined;
+        let next: string[] = SB_PRESETS;
+        if (s.colors.useReportTheme.value && palette && !palette.isHighContrast && typeof palette.getColor === "function") {
+            try {
+                const themed: string[] = [];
+                for (let i = 0; i < SB_PRESETS.length; i++) {
+                    const c = palette.getColor(`zx-slot-${i}`);
+                    if (c && typeof c.value === "string" && /^#[0-9a-f]{6}$/i.test(c.value)) themed.push(c.value);
+                }
+                if (themed.length) next = themed;
+            } catch { /* a host that throws keeps the fixed row */ }
+        }
+        this.presets.splice(0, this.presets.length, ...next);
     }
 
     /** Power BI high contrast wins over light/dark, so the gear matches the chart. */

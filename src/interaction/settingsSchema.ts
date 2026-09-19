@@ -86,12 +86,31 @@ function num(object: string, prop: string, acc: (m: Model) => AnySlice): Entry {
         setLocal: (m, v) => { acc(m).value = Number(v); },
     };
 }
+/**
+ * A colour as the hex string Power BI's `fill` expects, whatever shape it came in:
+ * a string, a picker value `{ value }`, or a fill `{ solid: { color } }`.
+ * zentrix-org-chart#14 (OC-QA-27) found `connectors.color.solid.color =
+ * '[object Object]'` in a saved report; `String(object)` is exactly what makes
+ * that, so nothing that is not a string colour is ever written from here.
+ */
+export function hexOf(v: unknown): string | null {
+    if (typeof v === "string") return v;
+    if (v && typeof v === "object") {
+        const o = v as { value?: unknown; solid?: { color?: unknown } };
+        if (typeof o.value === "string") return o.value;
+        if (o.solid && typeof o.solid.color === "string") return o.solid.color;
+    }
+    return null;
+}
 function color(object: string, prop: string, acc: (m: Model) => AnySlice): Entry {
     return {
         get: (m) => acc(m).value.value,
-        set: (p, v) => p(object, prop,
-            { solid: { color: String(v) } } as unknown as powerbi.DataViewPropertyValue),
-        setLocal: (m, v) => { acc(m).value = { value: String(v) }; },
+        set: (p, v) => {
+            const hex = hexOf(v);
+            if (hex === null) return;
+            p(object, prop, { solid: { color: hex } } as unknown as powerbi.DataViewPropertyValue);
+        },
+        setLocal: (m, v) => { const hex = hexOf(v); if (hex !== null) acc(m).value = { value: hex }; },
     };
 }
 
@@ -515,11 +534,11 @@ export const SB_CATS: SBCategory[] = [
                         control: "switch", label: "Compare periods", key: "orgAnalysis.compareperiods",
                         note: "Needs the Period field. Marks joiners, leavers and movers between the two most recent periods.",
                     },
-                    { control: "divider" },
-                    {
-                        control: "switch", label: "Conditional formatting", key: "rules.enabled",
-                        note: "Colour cards by rule. The rule editor arrives with the overlay chrome.",
-                    },
+                    // "Conditional formatting" (rules.enabled) is NOT offered until the rule
+                    // editor exists (zentrix-org-chart#17, OC-QA-37): a switch with no way
+                    // to define a rule is the dead control this product exists to beat.
+                    // The key stays bound in KEYS so a stored rule still applies and Reset
+                    // still clears it.
                 ],
             },
         ],

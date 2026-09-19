@@ -351,6 +351,10 @@ class RulesCard extends FormattingSettingsCard {
 
     name = "rules";
     displayName = "Rules";
+    /** Hidden from the pane until the rule editor ships (#17, OC-QA-37). The values
+     *  still populate — `populateFormattingSettingsModel` ignores `visible` — so a
+     *  report that stored rules keeps them. */
+    visible = false;
     slices: FormattingSettingsSlice[] = [this.enabled, this.definition];
 }
 
