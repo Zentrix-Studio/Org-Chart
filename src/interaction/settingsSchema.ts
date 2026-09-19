@@ -107,6 +107,7 @@ const KEYS: Record<string, Entry> = {
     "layout.orientation": dropdown("layout", "orientation", (m) => m.layout.orientation),
     "layout.levelGap": num("layout", "levelGap", (m) => m.layout.levelGap),
     "layout.siblingGap": num("layout", "siblingGap", (m) => m.layout.siblingGap),
+    "layout.leafStack": dropdown("layout", "leafStack", (m) => m.layout.leafStack),
     "layout.fillViewport": bool("layout", "fillViewport", (m) => m.layout.fillViewport),
     "layout.collapseToFit": bool("layout", "collapseToFit", (m) => m.layout.collapseToFit),
 
@@ -249,6 +250,12 @@ export const SB_CATS: SBCategory[] = [
                     {
                         control: "stepper", label: "Sibling spacing", key: "layout.siblingGap",
                         min: 4, max: 200, step: 2, suffix: "px",
+                    },
+                    { control: "divider" },
+                    {
+                        control: "segText", label: "Leaf reports", key: "layout.leafStack",
+                        options: [opt("auto", "Auto"), opt("row", "Row"), opt("stacked", "Stacked")],
+                        note: "Put a manager's direct reports in columns so wide teams stay readable. Auto stacks a team only when that draws the chart larger.",
                     },
                 ],
             },

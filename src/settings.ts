@@ -46,6 +46,21 @@ class LayoutCard extends FormattingSettingsCard {
         options: { minValue: { type: ValidatorType.Min, value: 4 }, maxValue: { type: ValidatorType.Max, value: 200 } },
     });
 
+    /** Leaf reports (OC-030, zentrix-org-chart#1): a manager whose reports are
+     *  all leaves gets them in columns instead of one row. Auto stacks only when
+     *  that draws the chart larger, so a team that already fits looks as it did. */
+    leafStack = new formattingSettings.ItemDropdown({
+        name: "leafStack",
+        displayName: "Leaf reports",
+        description: "Put a manager's direct reports in columns so wide teams stay readable. Auto stacks a team only when that draws the chart larger.",
+        items: [
+            { value: "auto", displayName: "Auto" },
+            { value: "row", displayName: "Row" },
+            { value: "stacked", displayName: "Stacked" },
+        ],
+        value: { value: "auto", displayName: "Auto" },
+    });
+
     /** Stretch the spacing between levels so the chart fills the visual instead
      *  of sitting as a thin band in the middle of it. While this is on, level
      *  spacing is a MINIMUM rather than an exact value. */
@@ -87,7 +102,7 @@ class LayoutCard extends FormattingSettingsCard {
     name = "layout";
     displayName = "Layout";
     slices: FormattingSettingsSlice[] = [
-        this.orientation, this.levelGap, this.siblingGap, this.fillViewport,
+        this.orientation, this.levelGap, this.siblingGap, this.leafStack, this.fillViewport,
         this.collapseToFit, this.collapseToFitDone, this.collapsed,
     ];
 }

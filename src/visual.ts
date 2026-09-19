@@ -25,17 +25,20 @@ import {
     buildHierarchy, hiddenByCollapse, isParentNode,
     serializeCollapsed, deserializeCollapsed, Hierarchy,
 } from "./model/hierarchy";
-import { treeLayout, fitAvoiding, cardRects, LayoutResult, LayoutOptions, ScreenRect } from "./model/treeLayout";
+import {
+    treeLayout, fitAvoiding, cardRects, rootsBox, LayoutResult, LayoutOptions, ScreenRect,
+} from "./model/treeLayout";
 import { renderLegend, LegendItem, LEGEND_HEIGHT } from "./render/legend";
 import { createSearchBox, SearchHandle } from "./interaction/search";
 import {
-    createZoomPan, renderZoomControls, ZoomPanHandle, ZOOM_STEP, MIN_FIT_SCALE, MAX_AUTO_SCALE,
+    createZoomPan, renderZoomControls, ZoomPanHandle, ZOOM_STEP, MAX_AUTO_SCALE,
     GEAR_CLEARANCE, CONTROL_SIZE,
 } from "./interaction/zoomPan";
 import {
     depthThatFits, fillLevelGap, levelRatioFor, levelScale, visibleDepth, NO_COLLAPSE,
+    arrangeFor, FitScale, LeafMode,
 } from "./model/autoFit";
-import { renderTree, trimToWidth } from "./render/tree";
+import { renderTree, trimToWidth, smallestNameSize } from "./render/tree";
 import { renderLanding as renderLandingPage } from "./render/landing";
 import { PhotoShape, PhotoFallback } from "./render/tree";
 import { LandingPage } from "./interaction/landingPage";
@@ -68,7 +71,17 @@ import { buildOrgRows, toCsv } from "./model/orgTable";
 type SvgSel = Selection<SVGSVGElement, unknown, null, undefined>;
 type GSel = Selection<SVGGElement, unknown, null, undefined>;
 
+/**
+ * The legibility floor (OC-030, zentrix-org-chart#1): no automatic view draws a
+ * name smaller than this many pixels on screen. The fit, the opening
+ * collapse, level sizing and search all aim at it; only the reader's own − or
+ * wheel goes below it.
+ */
+export const FLOOR_PX = 9;
+
 export class Visual implements IVisual {
+    /** Clip ids are unique per DOCUMENT: two Org Charts on one page share one. */
+    private static clipSeq = 0;
     private host: IVisualHost;
     private events: IVisualEventService;
     private selectionManager: ISelectionManager;
@@ -117,7 +130,9 @@ export class Visual implements IVisual {
     /** The width the search box may use this render, after the chrome in its row. */
     private searchWidth = 0;
     private lastFit: { bounds: { minX: number; minY: number; maxX: number; maxY: number };
-        width: number; height: number; maxScale: number } | null = null;
+        width: number; height: number; maxScale: number;
+        /** The legibility floor for this render, and what a floored view keeps on screen. */
+        minScale: number; anchor: ScreenRect | null } | null = null;
 
     private svg: SvgSel;
     private viewport: GSel;
@@ -179,7 +194,16 @@ export class Visual implements IVisual {
         bindBookmarks(this.selectionManager, () => {
             if (this.lastOptions) this.update(this.lastOptions);
         });
-        this.viewport = this.svg.append("g").attr("class", "viewport") as GSel;
+        // The chart draws inside a clip that ends above the bottom chrome band (the
+        // status line and the legend). Since OC-030 the fit can stop at the
+        // legibility floor and crop, and a crop — or a reader's pan — must not run
+        // cards under that text. The clip lives on a wrapper because d3-zoom
+        // transforms `viewport` itself, which would drag a clip set there along.
+        const clipId = "zxoc-clip-" + (Visual.clipSeq++);
+        this.svg.append("defs").append("clipPath").attr("id", clipId).attr("class", "chart-clip")
+            .append("rect").attr("x", 0).attr("y", 0).attr("width", 0).attr("height", 0);
+        this.viewport = this.svg.append("g").attr("class", "chart-area").attr("clip-path", `url(#${clipId})`)
+            .append("g").attr("class", "viewport") as GSel;
         this.chrome = this.svg.append("g").attr("class", "chrome") as GSel;
 
         // A press on the chart must dismiss the gear. d3-zoom stops the mousedown
@@ -210,7 +234,9 @@ export class Visual implements IVisual {
                 countLabel: (at, total) => this.loc.fmt("Search_Count", at, total),
                 noMatchLabel: this.loc.get("Search_NoMatch"),
                 nextLabel: this.loc.get("Search_Next"),
-                onJump: (i) => this.jumpTo(i),
+                // A found card is shown at a size it can be read at (OC-030):
+                // centring it at a 4px scale found nothing.
+                onJump: (i) => this.jumpTo(i, Math.max(1, this.lastFit ? this.lastFit.minScale : 1)),
                 onMatches: (hits) => { this.searchHits = hits; this.paintSearch(); },
                 dark: false,
                 fg: "#15161E", bg: "#FFFFFF", stroke: "#E4E4EC", accent,
@@ -395,6 +421,23 @@ export class Visual implements IVisual {
                 siblingGap: this.settings.layout.siblingGap.value,
             };
 
+            // The floating chrome is settled BEFORE anything is fitted (OC-028):
+            // every choice below is measured against the view the reader will get.
+            this.placeSearchBox(w);
+            const sizeMode = String(this.settings.nodes.sizeMode.value.value);
+            const maxScale = sizeMode === "fixed" ? 1 : MAX_AUTO_SCALE;
+            const fitBox = { width: w, height: h - chromeInset };
+            const obstacles = this.chromeObstacles(fitBox.width, fitBox.height);
+            const fitK: FitScale = (l) => fitAvoiding(l.bounds, cardRects(l), fitBox, obstacles, 16, maxScale).k;
+            // The scale at which the smallest drawn name is FLOOR_PX on screen.
+            // Never above 1: an author who picks 7px names has chosen them.
+            const kFloor = Math.min(1, FLOOR_PX / Math.max(1, smallestNameSize(
+                this.settings.nodes.cardHeight.value, this.settings.labels.nameSize.value,
+                this.settings.labels.titleSize.value,
+            )));
+            const leafMode = String(this.settings.layout.leafStack.value.value || "auto") as LeafMode;
+            const arrange = arrangeFor(hierarchy, layoutOptions, fitK, leafMode, kFloor);
+
             // A hierarchy too big to show whole opens with its deep levels
             // collapsed, at the TOP of the tree. Without this the opening view of
             // a 169-person org is a 9% slice of its middle — technically fitted,
@@ -405,9 +448,10 @@ export class Visual implements IVisual {
                 && !this.autoFitApplied
                 && this.collapsedKeys.size === 0) {
                 this.autoFitApplied = true;
-                const depth = depthThatFits(
-                    hierarchy, layoutOptions, { width: w, height: h - chromeInset }, MIN_FIT_SCALE,
-                );
+                // Aimed at the legibility floor, with stacking and wrapping chosen
+                // per level (they change what fits), and free to stop at the
+                // roots when not even the first level is readable (OC-030).
+                const depth = depthThatFits(hierarchy, layoutOptions, fitBox, kFloor, fitK, arrange);
                 if (depth !== NO_COLLAPSE) {
                     for (let i = 0; i < keys.length; i++) {
                         if (hierarchy.depth[i] === depth && isParentNode(hierarchy, i)) {
@@ -423,6 +467,8 @@ export class Visual implements IVisual {
                 if (this.collapsedKeys.has(keys[i]) && isParentNode(hierarchy, i)) collapsed.add(i);
             }
             const hidden = hiddenByCollapse(hierarchy, collapsed);
+            // Leaf stacking and forest wrapping for what is actually on screen.
+            Object.assign(layoutOptions, arrange(hidden));
 
             // Fit scales on the tighter axis, so a wide, shallow org fits by
             // width and then leaves most of the height empty. Stretching the gap
@@ -431,28 +477,23 @@ export class Visual implements IVisual {
             // Auto lets the whole chart draw above 1:1 when the hierarchy leaves
             // room, so cards and their type grow together instead of sitting as
             // postage stamps in the middle of an empty canvas.
-            const sizeMode = String(this.settings.nodes.sizeMode.value.value);
-            const maxScale = sizeMode === "fixed" ? 1 : MAX_AUTO_SCALE;
 
             // Cards grow towards the root. The ratio is chosen against THIS
             // viewport and THIS hierarchy, so the growth comes out of empty space
             // rather than out of the leaves — and the layout reserves each card's
             // real size, so a big parent can never overlap its neighbours.
             if (sizeMode === "level") {
-                const ratio = levelRatioFor(
-                    hierarchy, hidden, layoutOptions, { width: w, height: h - chromeInset },
-                    MIN_FIT_SCALE, maxScale,
-                );
+                // Growth only when the LEAVES still clear the floor afterwards
+                // (OC-030): spending the room on a 4x root while its 21 reports
+                // draw at 4px is what the By-level default used to do.
+                const ratio = levelRatioFor(hierarchy, hidden, layoutOptions, fitBox, kFloor, maxScale, fitK);
                 if (ratio > 1) {
                     const deepest = visibleDepth(hierarchy, hidden);
                     layoutOptions.levelScale = (d: number) => levelScale(d, deepest, ratio);
                 }
             }
             if (this.settings.layout.fillViewport.value) {
-                layoutOptions.levelGap = fillLevelGap(
-                    hierarchy, hidden, layoutOptions, { width: w, height: h - chromeInset },
-                    MIN_FIT_SCALE, maxScale,
-                );
+                layoutOptions.levelGap = fillLevelGap(hierarchy, hidden, layoutOptions, fitBox, kFloor, maxScale, fitK);
             }
 
             const layout = treeLayout(hierarchy, hidden, layoutOptions);
@@ -461,26 +502,12 @@ export class Visual implements IVisual {
             // a collapse, a resize, a different orientation or card size. A pan or
             // zoom the user performed is kept through every other update, because
             // yanking someone back to fit mid-read is worse than a stale view.
-            this.lastFit = { bounds: layout.bounds, width: w, height: h - chromeInset, maxScale };
+            this.lastFit = {
+                bounds: layout.bounds, width: fitBox.width, height: fitBox.height, maxScale,
+                minScale: kFloor, anchor: rootsBox(hierarchy, layout),
+            };
+            this.svg.select("clipPath.chart-clip rect").attr("width", w).attr("height", Math.max(0, fitBox.height));
             this.lastCards = cardRects(layout);
-            // The fit has to know where the floating chrome will be, so its
-            // visibility is settled BEFORE fitting (OC-028). Both calls repeat below
-            // with the rest of their state; each is idempotent.
-            this.syncOverlay(w, h);
-            if (this.searchBox) {
-                // The gear can be pinned top-left, where the search box lives: start after it.
-                const top = this.rowSpan(8, 34, w);
-                this.searchInset = top.x - 10;
-                // …and stop short of whatever holds the right end of the row — the
-                // view switch, since OC-029. The box is its field plus ~80px of count
-                // and button; setViewport reserves 110, hence the +30. On the open
-                // canvas this is exactly the old width; beside the switch it shrinks,
-                // and stands down where it cannot fit, like every other chrome piece.
-                this.searchWidth = Math.min(w - this.searchInset, top.right - top.x + 30);
-                this.searchBox.setLeft(top.x);
-                this.searchBox.setVisible(this.settings.overlays.showSearch.value && this.allowInteractions);
-                this.searchBox.setViewport(this.searchWidth);
-            }
             this.lastLayout = layout;
             this.lastHierarchy = hierarchy;
             this.lastKeys = keys;
@@ -491,6 +518,9 @@ export class Visual implements IVisual {
                 this.settings.layout.levelGap.value, this.settings.layout.siblingGap.value,
                 this.settings.layout.fillViewport.value, layoutOptions.levelGap,
                 this.settings.nodes.sizeMode.value.value,
+                // Stacking and wrapping change the picture without changing the counts above.
+                layoutOptions.leafStack ?? 0, layoutOptions.rootsPerRow ?? 0,
+                this.settings.labels.nameSize.value, this.settings.labels.titleSize.value,
                 // Chrome the fit steers around: moving or hiding it changes the fit.
                 this.settings.overlays.showSearch.value, this.settings.toolbar.show.value,
                 this.settings.toolbar.position.value.value, this.allowInteractions,
@@ -1258,6 +1288,28 @@ export class Visual implements IVisual {
     }
 
     /**
+     * Put the search box in the top row, clear of a gear pinned top-left and of
+     * the view switch. Idempotent: called before the fit so the fit can steer
+     * around it, and the box keeps its state across renders.
+     */
+    private placeSearchBox(w: number): void {
+        this.syncOverlay(w, this.lastOptions ? this.lastOptions.viewport.height : 0);
+        if (!this.searchBox) return;
+        // The gear can be pinned top-left, where the search box lives: start after it.
+        const top = this.rowSpan(8, 34, w);
+        this.searchInset = top.x - 10;
+        // …and stop short of whatever holds the right end of the row — the
+        // view switch, since OC-029. The box is its field plus ~80px of count
+        // and button; setViewport reserves 110, hence the +30. On the open
+        // canvas this is exactly the old width; beside the switch it shrinks,
+        // and stands down where it cannot fit, like every other chrome piece.
+        this.searchWidth = Math.min(w - this.searchInset, top.right - top.x + 30);
+        this.searchBox.setLeft(top.x);
+        this.searchBox.setVisible(this.settings.overlays.showSearch.value && this.allowInteractions);
+        this.searchBox.setViewport(this.searchWidth);
+    }
+
+    /**
      * Hand the gear this render's settings, theme and corner.
      *
      * The gear pins top-RIGHT whenever its position is Auto (CEO, 2026-09-12).
@@ -1522,19 +1574,17 @@ export class Visual implements IVisual {
     }
 
     /**
-     * Fit the whole chart into the space the host gives us.
+     * Fit the chart into the space the host gives us — down to the legibility
+     * floor, and no further (OC-030, zentrix-org-chart#1).
      *
-     * The automatic fit used to stop at a readable floor and CROP the rest, on
-     * the theory that a readable window beats an unreadable whole. In practice
-     * that is not what a fit is for: going from a report tile to focus mode, the
-     * chart simply did not use the new space — it stayed cropped at both edges.
-     *
-     * The floor belongs earlier, where it can be paid for properly: the opening
-     * auto-collapse (`depthThatFits`) and the level ratio both target
-     * `MIN_FIT_SCALE`, so the view the author OPENS on is readable by
-     * construction. Once they expand past that they have asked to see more, and
-     * the honest answer is to show all of it, smaller — with zoom and pan for
-     * detail.
+     * OC-021 removed the old floor because it CROPPED in silence, and focus mode
+     * gained nothing. That traded one failure for another: with no floor a
+     * manager with 21 reports drew every name at 3–4px on a full page. The floor
+     * is back at a readable 9px name, but paid for up front by stacking leaf
+     * reports, wrapping forests and collapsing to fit, so the fit rarely needs
+     * it. When it does, the view anchors on the roots and the pan cue says part
+     * of the chart is off screen. ⛶ and `0` land here too; only − and the wheel
+     * go below the floor, because that is the reader asking for an overview.
      */
     private refit(): void {
         if (!this.lastFit || !this.zoom) return;
@@ -1545,8 +1595,10 @@ export class Visual implements IVisual {
             this.chromeObstacles(this.lastFit.width, this.lastFit.height),
             16,
             this.lastFit.maxScale,
+            this.lastFit.minScale,
+            this.lastFit.anchor,
         );
-        this.zoom.apply(t);
+        this.zoom.apply({ k: t.k, tx: t.tx, ty: t.ty });
         this.zoom.clearTouched();
     }
 

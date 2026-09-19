@@ -167,3 +167,29 @@ export function dottedPath(
     const out = swap ? pts.map((p) => ({ x: p.y, y: p.x })) : pts;
     return roundedPath(out, radius);
 }
+
+/**
+ * A stacked report's connector (OC-030): out of the manager, along the bus to
+ * this column's spine, down the spine to the card, and in from the side.
+ *
+ * The parent-to-child elbow cannot be used for a stacked block — it would drop
+ * straight through the rows above the card. Every card in a column shares the
+ * same spine, so the column reads as one bracket, the way Visio draws it.
+ *
+ *   top-down    parent bottom → bus (y) → spine (x) → card centre (y) → card left
+ *   left-right  parent right  → bus (x) → spine (y) → card centre (x) → card top
+ */
+export function stackedPath(
+    parent: CardBox,
+    child: CardBox,
+    orientation: Orientation,
+    spine: number,
+    bus: number,
+): string {
+    if (orientation === "leftRight") {
+        const x1 = parent.cx + parent.w / 2;
+        return `M${r(x1)},${r(parent.cy)} H${r(bus)} V${r(spine)} H${r(child.cx)} V${r(child.cy - child.h / 2)}`;
+    }
+    const y1 = parent.cy + parent.h / 2;
+    return `M${r(parent.cx)},${r(y1)} V${r(bus)} H${r(spine)} V${r(child.cy)} H${r(child.cx - child.w / 2)}`;
+}

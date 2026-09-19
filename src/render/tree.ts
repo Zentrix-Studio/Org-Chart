@@ -12,7 +12,7 @@ import { Selection } from "d3";
 import { Hierarchy, directReports, totalDescendants } from "../model/hierarchy";
 import { LayoutResult } from "../model/treeLayout";
 import { OrgNode, ConnectorStyle, Orientation } from "../types";
-import { CardBox, connectorPath, dottedPath } from "./connectors";
+import { CardBox, connectorPath, dottedPath, stackedPath } from "./connectors";
 import { Surface, fontFamily, posSafe, negSafe } from "../theme/zentrixTokens";
 import { composite, contrastRatio, readableInk } from "../theme/palette";
 
@@ -106,6 +106,49 @@ type LinkSel = Selection<SVGPathElement, LinkDatum, SVGGElement, unknown>;
 
 const ACCENT_BAR_W = 4;
 const AVATAR_PAD = 9;
+/** Type stack: em box per line, lead between lines, vertical padding. See `typeScale`. */
+const LINE = 1.25;
+const LEAD = 2;
+const VPAD = 2;
+
+/**
+ * The name size a scale-1 card draws, with its title line shown — the smallest
+ * a name is ever drawn at by default. The legibility floor (OC-030) is set
+ * against this, so it holds whether the title is on or off: with the title off a
+ * name may grow into the freed line, but never shrinks below this (OC-QA-24).
+ */
+export function baseNameSize(cardHeight: number, nameSize: number, titleSize: number): number {
+    const room = cardHeight - 2 * VPAD - LEAD;
+    const want = LINE * nameSize + LINE * titleSize;
+    return want <= 0 || want <= room ? nameSize : nameSize * Math.max(0.25, room / want);
+}
+
+/** Labels → Name size default. A larger name may shrink to fit its card down to this. */
+export const NAME_SIZE_DEFAULT = 12.5;
+
+/**
+ * The smallest a name is ever drawn at on a scale-1 card: its title-on size, or
+ * the default size if the author set a larger one (a large name gives way to the
+ * card's width down to the default). The legibility floor is set against this.
+ */
+export function smallestNameSize(cardHeight: number, nameSize: number, titleSize: number): number {
+    return Math.min(baseNameSize(cardHeight, nameSize, titleSize), Math.max(nameSize > NAME_SIZE_DEFAULT ? NAME_SIZE_DEFAULT : nameSize, 0));
+}
+
+/**
+ * A collapsed branch's count, short enough for its pill (OC-QA-33, #6): exact
+ * below 10,000, then 13.7K / 137K / 1.4M. A 36,000-person org read "3689" for
+ * 13,689 because a fifth digit did not fit the disc.
+ */
+export function compactCount(n: number): string {
+    if (!isFinite(n) || n < 10000) return String(Math.max(0, Math.round(n)));
+    const unit = (v: number, suffix: string): string => {
+        const s = v < 100 ? (Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "") : String(Math.round(v));
+        return s + suffix;
+    };
+    if (n < 999500) return unit(n / 1000, "K");
+    return unit(n / 1e6, "M");
+}
 
 /**
  * Truncate to fit an approximate pixel width.
@@ -191,7 +234,11 @@ export function renderTree(
     link.exit().remove();
     link.enter().append("path").attr("class", "connector")
         .merge(link)
-        .attr("d", (d) => connectorPath(boxOf(d.p), boxOf(d.c), opts.orientation, opts.connectorStyle))
+        // A stacked report hangs off its column's spine (OC-030); the elbow would
+        // cut straight through the rows above it.
+        .attr("d", (d) => (layout.spine && isFinite(layout.spine[d.c])
+            ? stackedPath(boxOf(d.p), boxOf(d.c), opts.orientation, layout.spine[d.c], layout.bus[d.c])
+            : connectorPath(boxOf(d.p), boxOf(d.c), opts.orientation, opts.connectorStyle)))
         .attr("fill", "none")
         .attr("stroke", opts.connectorColor)
         .attr("stroke-width", opts.connectorWidth)
@@ -260,9 +307,6 @@ export function renderTree(
      * `LINE` (em box) and `LEAD` come from measured `getBBox` extents: ascent is
      * ~0.97em and descent ~0.22em, so 1.25em holds one line with a hair to spare.
      */
-    const LINE = 1.25;
-    const LEAD = 2;
-    const VPAD = 2;
     const hasTitleLine = (i: number): boolean => opts.showTitle && !!nodes[i].title;
     /** 1 when the type already fits; below 1 only when the card is too short. */
     const typeScale = (i: number): number => {
@@ -274,6 +318,14 @@ export function renderTree(
         return Math.max(0.25, room / want);
     };
     const nameSize = (i: number): number => opts.nameSize * scale(i) * typeScale(i);
+    /** The same, as if this card's title line were shown — the name's lower bound. */
+    const typeScaleWithTitle = (i: number): number => {
+        const s = scale(i);
+        const room = H(i) - 2 * VPAD * s - LEAD * s;
+        const want = LINE * opts.nameSize * s + LINE * opts.titleSize * s;
+        if (want <= 0 || want <= room) return 1;
+        return Math.max(0.25, room / want);
+    };
     const titleSize = (i: number): number => opts.titleSize * scale(i) * typeScale(i);
     /** Top of the centred text block. */
     const blockTop = (i: number): number => {
@@ -383,6 +435,7 @@ export function renderTree(
     all.attr("transform", (i) => `translate(${layout.x[i] - W(i) / 2},${layout.y[i] - H(i) / 2})`)
         .attr("tabindex", 0)
         .attr("role", "treeitem")
+        .attr("aria-level", (i) => h.depth[i] + 1)
         .attr("aria-label", (i) => {
             const n = nodes[i];
             const reports = directReports(h, i);
@@ -509,8 +562,39 @@ export function renderTree(
         .attr("fill", (i) => (vacant(i) && !opts.highContrast ? opts.surface.muted : opts.surface.fg))
         .text((i) => fitText(nodes[i].name, textRoom(i, nameY(i) - nameSize(i), nameY(i) + nameSize(i) * 0.2), nameSize(i)))
         .each(function (i) {
-            trimToWidth(this as SVGTextElement, nodes[i].name,
-                textRoom(i, nameY(i) - nameSize(i), nameY(i) + nameSize(i) * 0.2));
+            const el = this as SVGTextElement;
+            const room = (size: number, y: number): number => textRoom(i, y - size, y + size * 0.2);
+            /*
+             * OC-QA-24 (#13): a 20px name on a 124px card truncated to "Far…",
+             * and hiding the title made it worse by growing the name into the
+             * freed height. A size is only worth having if the name fits across
+             * the card at it, so a name that would be cut short gives way to the
+             * card's WIDTH first — down to `floor` — and only then is ellipsized.
+             */
+            const grown = nameSize(i);
+            // Never below the size the name draws at with its title shown, and a
+            // name set LARGER than the default gives way to the card's width down
+            // to the default, no further — the size the legibility floor is set
+            // against (see `smallestNameSize`).
+            const floor = Math.min(grown, opts.nameSize * scale(i) * typeScaleWithTitle(i),
+                NAME_SIZE_DEFAULT * scale(i));
+            if (floor < grown - 0.01) {
+                const want = measureAt(el, nodes[i].name, grown);
+                const avail = room(grown, nameY(i));
+                if (want > avail && want > 0) {
+                    const size = Math.max(floor, grown * (avail / want));
+                    // Alone on the card, the smaller name re-centres. Above a
+                    // title it keeps its baseline, so it can only move AWAY from
+                    // the title line (OC-QA-14 must still hold).
+                    const y = hasTitleLine(i) ? nameY(i) : (H(i) - LINE * size) / 2 + size;
+                    el.setAttribute("font-size", String(size));
+                    el.setAttribute("y", String(y));
+                    el.textContent = fitText(nodes[i].name, room(size, y), size);
+                    trimToWidth(el, nodes[i].name, room(size, y));
+                    return;
+                }
+            }
+            trimToWidth(el, nodes[i].name, room(grown, nameY(i)));
         });
 
     all.select("text.card-title")
@@ -625,31 +709,44 @@ export function renderTree(
         const cx = opts.orientation === "leftRight" ? W(i) : W(i) / 2;
         const cy = opts.orientation === "leftRight" ? H(i) / 2 : H(i);
         const rr = 9 * Math.min(1.6, Math.max(1, scale(i)));
-        const circle = document.createElementNS(ns, "circle");
-        circle.setAttribute("cx", String(cx));
-        circle.setAttribute("cy", String(cy));
-        circle.setAttribute("r", String(rr));
-        circle.setAttribute("fill", isCollapsed ? opts.colorOf(i) : opts.surface.cardFill);
-        circle.setAttribute("stroke", opts.colorOf(i));
-        circle.setAttribute("stroke-width", "1.3");
-        circle.setAttribute("cursor", "pointer");
+        const count = totalDescendants(h, i);
+        const label = isCollapsed ? compactCount(count) : "−";
+        const fontPx = isCollapsed ? 9 * Math.min(1.6, Math.max(1, scale(i))) : rr * 1.33;
+        // A disc for up to three digits, a pill past that, so the leading digit
+        // is never cut off (OC-QA-33, #6). Same height, same centre either way.
+        const pw = isCollapsed ? Math.max(rr * 2, label.length * fontPx * 0.62 + rr * 0.9) : rr * 2;
+        const disc = document.createElementNS(ns, "rect");
+        disc.setAttribute("class", "toggle-disc");
+        disc.setAttribute("x", String(cx - pw / 2));
+        disc.setAttribute("y", String(cy - rr));
+        disc.setAttribute("width", String(pw));
+        disc.setAttribute("height", String(rr * 2));
+        disc.setAttribute("rx", String(rr));
+        disc.setAttribute("ry", String(rr));
+        disc.setAttribute("fill", isCollapsed ? opts.colorOf(i) : opts.surface.cardFill);
+        disc.setAttribute("stroke", opts.colorOf(i));
+        disc.setAttribute("stroke-width", "1.3");
+        disc.setAttribute("cursor", "pointer");
         const glyph = document.createElementNS(ns, "text");
         glyph.setAttribute("x", String(cx));
-        glyph.setAttribute("y", String(cy + rr * 0.44));
+        glyph.setAttribute("y", String(cy + (isCollapsed ? fontPx * 0.35 : rr * 0.44)));
         glyph.setAttribute("text-anchor", "middle");
         glyph.setAttribute("font-family", fontFamily);
-        glyph.setAttribute("font-size", String(rr * 1.33));
+        glyph.setAttribute("font-size", String(fontPx));
         glyph.setAttribute("font-weight", "700");
         // Collapsed: a count on a solid disc — white or ink, whichever reads.
-        const disc = opts.colorOf(i);
+        const fill = opts.colorOf(i);
         glyph.setAttribute("fill", isCollapsed
-            ? (contrastOnDisc(disc))
-            : (opts.highContrast ? disc : readableInk(disc, opts.surface.cardFill)));
+            ? (contrastOnDisc(fill))
+            : (opts.highContrast ? fill : readableInk(fill, opts.surface.cardFill)));
         glyph.setAttribute("pointer-events", "none");
-        glyph.textContent = isCollapsed ? String(totalDescendants(h, i)) : "−";
-        if (isCollapsed) glyph.setAttribute("font-size", "9");
-        sel.appendChild(circle);
+        glyph.textContent = label;
+        // The exact number is always one hover away, however it is shortened.
+        const title = document.createElementNS(ns, "title");
+        title.textContent = isCollapsed ? `Expand: ${count.toLocaleString("en-US")} people` : "Collapse";
+        sel.appendChild(disc);
         sel.appendChild(glyph);
+        sel.appendChild(title);
         sel.setAttribute("class", "card-toggle");
     });
 }
@@ -709,4 +806,16 @@ export function renderDottedLines(
         .attr("stroke-dasharray", "4 4")
         .attr("stroke-linecap", "round")
         .attr("opacity", 0.75);
+}
+
+/** Rendered width of `text` at `fontPx` — measured where the host can, estimated in jsdom. */
+function measureAt(el: SVGTextElement, text: string, fontPx: number): number {
+    const guess = Array.from(text || "").length * fontPx * 0.56;
+    if (typeof el.getComputedTextLength !== "function") return guess;
+    try {
+        el.setAttribute("font-size", String(fontPx));
+        el.textContent = text;
+        const w = el.getComputedTextLength();
+        return w > 0 ? w : guess;
+    } catch { return guess; }
 }

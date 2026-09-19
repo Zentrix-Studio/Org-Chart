@@ -212,6 +212,27 @@
                     },
                     "displayNameKey": "Prop_layout_siblingGap"
                 },
+                "leafStack": {
+                    "displayName": "Leaf reports",
+                    "description": "Put a manager's direct reports in columns so wide teams stay readable. Auto stacks a team only when that draws the chart larger.",
+                    "type": {
+                        "enumeration": [
+                            {
+                                "value": "auto",
+                                "displayName": "Auto"
+                            },
+                            {
+                                "value": "row",
+                                "displayName": "Row"
+                            },
+                            {
+                                "value": "stacked",
+                                "displayName": "Stacked"
+                            }
+                        ]
+                    },
+                    "displayNameKey": "Prop_layout_leafStack"
+                },
                 "fillViewport": {
                     "displayName": "Fill the viewport",
                     "description": "Stretch the spacing between levels so the chart uses the whole visual rather than sitting as a thin band in the middle. While this is on, level spacing is a minimum.",

@@ -252,35 +252,35 @@ function sceneAnyDomain(ctx: SceneContext): SVGSVGElement {
     return svg;
 }
 
-/** MVP 3: a big org stays readable — wide rows, collapse, fit. */
+/** MVP 3: a big org stays readable — stacked reports, a legibility floor, collapse. */
 function sceneScale(ctx: SceneContext): SVGSVGElement {
     const svg = svgNode(VB, 320, 230);
     const s = ctx.surface;
     const line = ctx.dark ? "#4A4A63" : "#C9C9D8";
 
-    card(svg, 128, 16, 64, 26, ctx, { accentColor: accentStrong });
-    // a wide sibling row — 12 of them, evenly pitched, none overlapping
-    for (let i = 0; i < 12; i++) {
-        const x = 4 + i * 26;
-        svg.appendChild(elbow(160, 42, x + 10, 72, line));
-        card(svg, x, 72, 20, 22, ctx, { accentColor: categoryPalette[i % 8] });
+    // A manager with nine reports, stacked in three columns off their spines —
+    // what the chart actually draws for a wide team since OC-030.
+    card(svg, 120, 6, 80, 24, ctx, { accentColor: accentStrong });
+    svg.appendChild(pathNode("M160,30 V40 M44,40 H244", line, 1));
+    for (let c = 0; c < 3; c++) {
+        const spine = 44 + c * 100;
+        svg.appendChild(pathNode(`M${spine},40 V${48 + 2 * 30 + 11}`, line, 1));
+        for (let r = 0; r < 3; r++) {
+            const y = 48 + r * 30;
+            svg.appendChild(pathNode(`M${spine},${y + 11} H${spine + 8}`, line, 1));
+            card(svg, spine + 8, y, 70, 22, ctx, { accentColor: categoryPalette[(c * 3 + r) % 8] });
+        }
     }
-    svg.appendChild(textNode(160, 108, "40 siblings under one manager — never overlapping",
+    svg.appendChild(textNode(160, 150, "Wide teams stack into columns — every name stays 9px or larger",
         { size: 8.5, fill: s.muted, anchor: "middle" }));
 
     // a collapsed branch carrying its count
-    svg.appendChild(elbow(60, 126, 60, 152, line));
-    card(svg, 20, 126, 80, 24, ctx, { accentColor: categoryPalette[3] });
-    svg.appendChild(circleNode(100, 150, 9, ctx.dark ? "#2A2A3C" : "#F1EEFE", accentStrong));
-    svg.appendChild(textNode(100, 153.5, "+9", { size: 8, fill: accentStrong, weight: 700, anchor: "middle" }));
-    svg.appendChild(textNode(20, 176, "collapsed — and still collapsed after refresh",
+    card(svg, 20, 164, 80, 24, ctx, { accentColor: categoryPalette[3] });
+    svg.appendChild(rectNode(47, 181, 26, 16, 8, accentStrong));
+    svg.appendChild(textNode(60, 192, "13.7K", { size: 7.5, fill: "#FFFFFF", weight: 700, anchor: "middle" }));
+    svg.appendChild(textNode(112, 180, "Too big to read whole? It opens collapsed.",
         { size: 8.5, fill: s.muted }));
-
-    // the fit frame
-    svg.appendChild(rectNode(196, 122, 116, 62, 8, "none", accentStrong, 1.3, "4 3"));
-    svg.appendChild(pathNode("M204,132 h-6 v-6 M304,132 h6 v-6 M204,174 h-6 v6 M304,174 h6 v6", accentStrong, 1.6));
-    svg.appendChild(textNode(254, 158, "fit all", { size: 10, fill: accentStrong, weight: 700, anchor: "middle" }));
-    svg.appendChild(textNode(160, 206, "Opens at a depth you can read. Zoom, pan, or fit the whole chart.",
+    svg.appendChild(textNode(160, 214, "Zoom, pan, or fit. A note says when part of the chart is off screen.",
         { size: 8.5, fill: s.muted, anchor: "middle" }));
     return svg;
 }
@@ -384,7 +384,10 @@ function sceneFree(ctx: SceneContext): SVGSVGElement {
     svg.appendChild(textNode(160, 132, "Everything. Free.",
         { size: 15, fill: s.fg, weight: 800, anchor: "middle" }));
 
-    const chips = ["No node cap", "Export", "Dotted lines", "Org analysis", "Rules", "Annotations"];
+    // Only what a reader can actually reach in this build. Image export has no
+    // on-screen control yet, and the rules and note editors are not ported, so
+    // they are not advertised (OC-030; QA 2026-09-19 carousel-copy finding).
+    const chips = ["No node cap", "Dotted lines", "Org analysis", "Table + CSV", "Period compare"];
     let x = 0;
     let y = 148;
     chips.forEach((label) => {
@@ -450,10 +453,10 @@ export const PAGES: PageDefinition[] = [
         title: "It opens at a size you can actually read",
         scene: sceneScale,
         lines: [
-            "• Card-aware spacing: forty reports under one manager lay out without a single overlap.",
-            "• The opening view collapses deep levels rather than shrinking the chart past legibility — then zoom, pan, or fit the whole thing.",
+            "• A manager's direct reports stack into columns when one row would be too wide to read. Leaf reports: Auto, Row or Stacked.",
+            "• Nothing opens with a name smaller than 9 px. If the whole chart won't fit at that size, it opens collapsed to the levels that do, each with a count of what's folded away.",
+            "• Zoom out with − or the wheel to see all of it. Fit and search bring you back to a readable size, and a note says when part of the chart is off screen.",
             "• Collapse is stored by key, not by row position, so a filter, a re-sort or a refresh cannot lose it.",
-            "• It travels with the report and lands in bookmarks.",
         ],
     },
     {

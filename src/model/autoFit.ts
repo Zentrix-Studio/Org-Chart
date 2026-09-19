@@ -17,7 +17,7 @@
  */
 
 import { Hierarchy } from "./hierarchy";
-import { treeLayout, fitTransform, LayoutOptions } from "./treeLayout";
+import { treeLayout, fitTransform, LayoutOptions, LayoutResult, stackableShape } from "./treeLayout";
 
 /** Same padding `fitTransform` uses; the two have to agree about the free space. */
 const PAD = 16;
@@ -40,18 +40,44 @@ export const MAX_FILL_GAP_FACTOR = 4;
 export const NO_COLLAPSE = -1;
 
 /**
+ * The on-screen scale of a laid-out tree. The visual passes one that fits around
+ * its own chrome (`fitAvoiding`), so every decision below is made against the
+ * view the reader will actually get; the default is the plain fit.
+ */
+export type FitScale = (layout: LayoutResult) => number;
+
+/** Plain fit, for callers (and tests) with no chrome to steer around. */
+export function plainFit(viewport: { width: number; height: number }, maxScale = 1): FitScale {
+    return (layout) => fitTransform(layout.bounds, viewport, PAD, 0, maxScale).k;
+}
+
+/** Picks the stacking / wrapping for a given set of hidden nodes. */
+export type Arrange = (hidden: ReadonlySet<number>) => LayoutOptions;
+
+/**
  * The depth whose nodes should be collapsed, so levels `0..depth` stay visible.
  *
- * @param minScale the readable floor the opening view has to clear
- * @returns `NO_COLLAPSE` when the tree fits as it is, otherwise a depth >= 1.
- *          Never 0: collapsing the roots themselves would open on a single card
- *          and hide the entire chart.
+ * Walks DOWN from the roots and stops at the first level that no longer clears
+ * the floor, so the cost is a handful of layouts of a mostly-hidden tree even on
+ * a 36,000-row org (the old walk started from the whole tree).
+ *
+ * @param minScale the readable floor the opening view has to clear — since
+ *                 OC-030 the scale at which the smallest name is 9px on screen
+ * @param fit      the scale a layout will be drawn at (default: plain fit)
+ * @param arrange  how to lay out each candidate — stacking and wrapping change
+ *                 what fits, so they are chosen per candidate (default: as is)
+ * @returns `NO_COLLAPSE` when the tree fits as it is, otherwise the depth to
+ *          collapse at. 0 is allowed (OC-030, zentrix-org-chart#1): when not even
+ *          the first level fits, the chart opens on its roots, each with a count
+ *          of what is under it, rather than on a row of unreadable cards.
  */
 export function depthThatFits(
     h: Hierarchy,
     opts: LayoutOptions,
     viewport: { width: number; height: number },
     minScale: number,
+    fit?: FitScale,
+    arrange?: Arrange,
 ): number {
     const n = h.depth.length;
     if (n === 0) return NO_COLLAPSE;
@@ -60,25 +86,109 @@ export function depthThatFits(
     for (let i = 0; i < n; i++) if (h.depth[i] > maxDepth) maxDepth = h.depth[i];
     if (maxDepth === 0) return NO_COLLAPSE;
 
+    const scaleOf = fit ?? ((l: LayoutResult) => fitTransform(l.bounds, viewport).k);
     const fitsAt = (depth: number): boolean => {
         const hidden = new Set<number>();
-        if (depth >= 0) {
-            for (let i = 0; i < n; i++) if (h.depth[i] > depth) hidden.add(i);
-        }
-        const layout = treeLayout(h, hidden, opts);
+        for (let i = 0; i < n; i++) if (h.depth[i] > depth) hidden.add(i);
+        const layout = treeLayout(h, hidden, arrange ? arrange(hidden) : opts);
         if (layout.placed.length === 0) return true;
-        return fitTransform(layout.bounds, viewport).k >= minScale;
+        return scaleOf(layout) >= minScale - 1e-9;
     };
 
-    if (fitsAt(maxDepth)) return NO_COLLAPSE;       // the whole tree is fine as it is
-
-    // Deepest level that still clears the floor. Walking down from the root is
-    // O(depth) layouts of a tree that shrinks at every step, so this is cheap
-    // even at the 500-node cap.
-    for (let d = maxDepth - 1; d >= 1; d--) {
-        if (fitsAt(d)) return d;
+    // Deeper never makes the tree smaller, so the first level that breaks the
+    // floor ends the walk.
+    for (let d = 0; d <= maxDepth; d++) {
+        if (fitsAt(d)) continue;
+        return Math.max(0, d - 1);
     }
-    return 1;
+    return NO_COLLAPSE;
+}
+
+/** How leaf reports are laid out: "Leaf reports" in Layout. */
+export type LeafMode = "auto" | "row" | "stacked";
+
+/** Column counts worth trying: every count up to 8, then a coarse ladder. */
+function candidates(limit: number): number[] {
+    const out: number[] = [];
+    for (let c = 1; c <= Math.min(8, limit); c++) out.push(c);
+    for (const c of [10, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256]) if (c <= limit) out.push(c);
+    return out;
+}
+
+/**
+ * Choose how many columns a stacked leaf group may use, for this tree, this
+ * viewport and this card: the count that draws the chart largest (OC-030).
+ *
+ * Ties go to MORE columns — the closer to the familiar single row — and in Auto
+ * to no stacking at all, so a team that already fits keeps looking exactly as it
+ * did. Auto stacks groups of five or more; groups of two to four stack only when
+ * nothing else gets the names to the floor.
+ */
+export function chooseLeafStack(
+    h: Hierarchy,
+    hidden: ReadonlySet<number>,
+    opts: LayoutOptions,
+    fit: FitScale,
+    mode: LeafMode,
+    minScale = 0,
+): { leafStack: number; leafStackMin: number } {
+    const none = { leafStack: 0, leafStackMin: 2 };
+    if (mode === "row") return none;
+    const shape = stackableShape(h, hidden);
+    if (shape.maxGroup < 2) return none;
+
+    const tryMin = (min: number, start: { k: number; pick: { leafStack: number; leafStackMin: number } }) => {
+        let best = start;
+        const cs = candidates(shape.maxGroup - 1).reverse();       // most columns first
+        for (const c of cs) {
+            const k = fit(treeLayout(h, hidden, { ...opts, leafStack: c, leafStackMin: min }));
+            if (k > best.k * 1.005) best = { k, pick: { leafStack: c, leafStackMin: min } };
+        }
+        return best;
+    };
+
+    if (mode === "stacked") {
+        return tryMin(2, { k: -Infinity, pick: none }).pick;
+    }
+    const row = { k: fit(treeLayout(h, hidden, { ...opts, leafStack: 0 })), pick: none };
+    let best = shape.maxGroup >= 5 ? tryMin(5, row) : row;
+    if (best.k < minScale && shape.smallGroups) best = tryMin(2, best);
+    return best.pick;
+}
+
+/**
+ * Forests wrap (OC-030): how many roots to set side by side before starting a
+ * new shelf. Twenty-five roots in one line is what a department filter produces,
+ * and at any scale that is a strip. Ties go to the single line.
+ */
+export function chooseRootsPerRow(
+    h: Hierarchy,
+    hidden: ReadonlySet<number>,
+    opts: LayoutOptions,
+    fit: FitScale,
+): number {
+    const roots = stackableShape(h, hidden).roots;
+    if (roots < 2) return 0;
+    let best = { k: fit(treeLayout(h, hidden, { ...opts, rootsPerRow: 0 })), perRow: 0 };
+    for (const r of candidates(roots - 1).reverse()) {
+        const k = fit(treeLayout(h, hidden, { ...opts, rootsPerRow: r }));
+        if (k > best.k * 1.005) best = { k, perRow: r };
+    }
+    return best.perRow;
+}
+
+/** Stacking, then wrapping, for one hidden set — what `depthThatFits` tries per level. */
+export function arrangeFor(
+    h: Hierarchy,
+    opts: LayoutOptions,
+    fit: FitScale,
+    mode: LeafMode,
+    minScale = 0,
+): Arrange {
+    return (hidden) => {
+        const stacked = { ...opts, ...chooseLeafStack(h, hidden, opts, fit, mode, minScale) };
+        return { ...stacked, rootsPerRow: chooseRootsPerRow(h, hidden, stacked, fit) };
+    };
 }
 
 /**
@@ -105,6 +215,7 @@ export function fillLevelGap(
     viewport: { width: number; height: number },
     minScale: number,
     maxScale = 1,
+    fit?: FitScale,
 ): number {
     const base = Math.max(0, opts.levelGap);
     const layout = treeLayout(h, hidden, opts);
@@ -126,8 +237,24 @@ export function fillLevelGap(
     const room = (available / k) * 0.98;           // a hair under, so the other axis stays binding
     if (content >= room) return base;              // already full, or overflowing
 
-    const needed = (room - levels.size * depthSpan) / (levels.size - 1);
-    return Math.max(base, Math.min(MAX_FILL_GAP_FACTOR * depthSpan, needed));
+    // Every extra px of gap moves the deepest content by at most (levels - 1) px,
+    // so this can never push the depth axis past the room. (It used to assume the
+    // content was exactly levels × card, which a stacked block — deeper than its
+    // own level — is not.)
+    const needed = base + (room - content) / (levels.size - 1);
+    let gap = Math.max(base, Math.min(MAX_FILL_GAP_FACTOR * depthSpan, needed));
+    // The real fit steers around the visual's chrome, which can take room on the
+    // depth axis that the plain fit above does not know about. Stretching into it
+    // would shrink every card, so back off until it costs nothing.
+    if (fit && gap > base) {
+        const kBase = fit(layout);
+        for (let tries = 0; tries < 8 && gap > base; tries++) {
+            if (fit(treeLayout(h, hidden, { ...opts, levelGap: gap })) >= kBase * 0.995) break;
+            gap = base + (gap - base) / 2;
+            if (gap - base < 1) gap = base;
+        }
+    }
+    return gap;
 }
 
 
@@ -180,8 +307,10 @@ export function levelRatioFor(
     viewport: { width: number; height: number },
     minScale: number,
     maxScale = 1,
+    fit?: FitScale,
 ): number {
     const maxDepth = visibleDepth(h, hidden);
+    const scaleOf = fit ?? plainFit(viewport, maxScale);
     if (maxDepth === 0) return 1;
 
     // Both scales are measured WITHOUT the readable floor. With it, a chart that
@@ -189,7 +318,7 @@ export function levelRatioFor(
     // never fail — which is how 300 people under one manager still got 2× cards.
     const flat = treeLayout(h, hidden, opts);
     if (flat.placed.length === 0) return 1;
-    const flatK = fitTransform(flat.bounds, viewport, PAD, 0, maxScale).k;
+    const flatK = scaleOf(flat);
     // Nothing to give away: the chart is already too big to show at a readable
     // size, so bigger ancestors would only mean more panning.
     if (flatK < minScale) return 1;
@@ -199,7 +328,7 @@ export function levelRatioFor(
         const scaled = treeLayout(h, hidden, {
             ...opts, levelScale: (d) => levelScale(d, maxDepth, ratio),
         });
-        const k = fitTransform(scaled.bounds, viewport, PAD, 0, maxScale).k;
+        const k = scaleOf(scaled);
         // The leaf card pays for the growth, so it must not end up meaningfully
         // smaller than it would have been on a uniform chart.
         if (k >= minScale && k >= flatK * 0.92) return ratio;

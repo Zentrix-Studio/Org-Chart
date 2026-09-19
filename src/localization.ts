@@ -57,7 +57,7 @@ const DEFAULTS: Record<string, string> = {
     Status_Showing: "showing {0} of {1} people",
     Status_Cycles: "{0} circular reporting links shown as roots",
     Status_Roots: "{0} roots",
-    Status_Panned: "showing part of the chart — drag to pan, or use ⛶ to fit it all",
+    Status_Panned: "showing part of the chart — drag to pan, or use − to see everything",
     Status_People: "{0} people",
     Status_Managers: "{0} managers",
     Status_Layers: "{0} layers",
