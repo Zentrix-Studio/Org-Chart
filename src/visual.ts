@@ -19,6 +19,9 @@ import ISelectionManager = powerbi.extensibility.ISelectionManager;
 import DataView = powerbi.DataView;
 
 import { VisualFormattingSettingsModel } from "./settings";
+import {
+    FIRST_LEVEL, LAST_LEVEL, levelLadder, levelsShown,
+} from "./interaction/settingsSchema";
 import { EmptyReason, OrgModel, Orientation, ConnectorStyle, ColorMode, TooltipStyle } from "./types";
 import { buildOrgModel, missingRequiredRole, boundRoles } from "./model/dataTransform";
 import {
@@ -32,11 +35,15 @@ import { renderLegend, LegendItem, LEGEND_HEIGHT } from "./render/legend";
 import { createSearchBox, SearchHandle } from "./interaction/search";
 import {
     createZoomPan, renderZoomControls, ZoomPanHandle, ZOOM_STEP, MAX_AUTO_SCALE,
-    GEAR_CLEARANCE, CONTROL_SIZE,
+    GEAR_CLEARANCE, planActionBar, ActionCorner,
 } from "./interaction/zoomPan";
+import { renderLens, clearLens } from "./render/lens";
+import {
+    renderMinimap, clearMinimap, minimapBox, visibleBounds, showsEverything,
+} from "./render/minimap";
 import {
     depthThatFits, fillLevelGap, levelRatioFor, levelScale, visibleDepth, NO_COLLAPSE,
-    arrangeFor, FitScale, LeafMode,
+    arrangeFor, FitScale, LeafMode, uniformLevelsShown,
 } from "./model/autoFit";
 import { renderTree, trimToWidth, smallestNameSize } from "./render/tree";
 import { renderLanding as renderLandingPage } from "./render/landing";
@@ -78,6 +85,45 @@ type GSel = Selection<SVGGElement, unknown, null, undefined>;
  * wheel goes below it.
  */
 export const FLOOR_PX = 9;
+
+/**
+ * Where the gear and the view switch land when the author leaves them on Auto
+ * (CEO, 2026-09-20 — OC-034). The quick-action bar took the top-right corner,
+ * which OC-020 had given the gear. One constant, because three call sites used
+ * to carry the corner as a literal and they drifted apart.
+ */
+export const GEAR_AUTO_CORNER = "br";
+
+/**
+ * The size the OPENING view aims its names at (OC-035, CEO 2026-09-20).
+ *
+ * `FLOOR_PX` is the floor — the smallest a name may ever be drawn automatically.
+ * Opening AT the floor was the complaint: a chart technically readable at 9px,
+ * where the same org shown three levels shallower is comfortable and the rest is
+ * one click away behind a count. So the auto-collapse aims here and the floor
+ * stays what it is, the last line of defence for the fit.
+ *
+ * 11 gives ~0.88 at the default 12.5px name — a fifth bigger than the floor,
+ * and short of 1:1 so a chart that already fits comfortably is left alone.
+ */
+export const OPEN_PX = 11;
+
+/**
+ * Is this event target a piece of the visual's own chrome?
+ *
+ * Walks up from the target looking for any of the floating controls. Used to
+ * stand the lens down over them — a loupe magnifying the zoom buttons is noise,
+ * and one covering the button that turns it off is a trap.
+ */
+function overChrome(target: EventTarget | null): boolean {
+    let el = target as Element | null;
+    for (let hops = 0; el && hops < 12; hops++) {
+        const cls = typeof el.getAttribute === "function" ? el.getAttribute("class") || "" : "";
+        if (/\b(zoom-controls|zoom-button|zx-minimap|zx-view|zx-search|zsb-anchor|zsb-gear)\b/.test(cls)) return true;
+        el = el.parentElement;
+    }
+    return false;
+}
 
 export class Visual implements IVisual {
     /** Clip ids are unique per DOCUMENT: two Org Charts on one page share one. */
@@ -157,10 +203,42 @@ export class Visual implements IVisual {
     private viewport: GSel;
     private chrome: GSel;
 
+    /* The minimap and the lens each own a LAYER of their own. `renderStatus`
+     * clears `chrome` on every render, and both of these are also refreshed
+     * between renders — the minimap from the zoom handler, the lens from the
+     * pointer — so neither can live in a layer something else empties. */
+    private mapLayer: GSel;
+    private lensLayer: GSel;
+    /** `id` of the chart group, which the lens re-uses. Document-unique. */
+    private chartId = "";
+    private lensClipId = "";
+    /** The lens is session-local, like the view switch: a reader cannot persist. */
+    private lensOn = false;
+    /**
+     * True when the whole chart cannot be shown at the legibility floor, so
+     * "Show everything" is a different answer from "Fit to view" (OC-036).
+     * Computed at render, from the fit the reader is actually given.
+     */
+    private fullViewDiffers = false;
+    /** Last pointer position on the canvas, or null when the pointer is elsewhere. */
+    private lensPoint: { x: number; y: number } | null = null;
+
     /** Collapsed node KEYS (not indices) — survives refresh and cross-filter. */
     private collapsedKeys = new Set<string>();
     /** The stored collapse value as last read from the host; null before the first. */
     private lastHostCollapsed: string | null = null;
+
+    /** "Collapse deep levels to fit" as last seen, to spot the AUTHOR flipping it (OC-037). */
+    private lastCollapseToFit: boolean | null = null;
+
+    /** The level ladder as last applied by THIS instance (OC-035). */
+    private lastLadder: string | null = null;
+    /** A ladder written but not yet echoed back by the host. */
+    private pendingLadder: string | null = null;
+    /** The host's `levelsApplied` as last seen, to spot an outside change. */
+    private lastHostLadder: string | null = null;
+    /** What the ladder was before the pending write — how a stale update is spotted. */
+    private prevLadder: string | null = null;
     /** A collapse value WE wrote that the host has not echoed back yet. */
     private pendingCollapsed: string | null = null;
     /** Bumped whenever the collapse set is replaced from outside (bookmark, undo),
@@ -242,17 +320,32 @@ export class Visual implements IVisual {
         // legibility floor and crop, and a crop — or a reader's pan — must not run
         // cards under that text. The clip lives on a wrapper because d3-zoom
         // transforms `viewport` itself, which would drag a clip set there along.
-        const clipId = "zxoc-clip-" + (Visual.clipSeq++);
+        const seq = Visual.clipSeq++;
+        const clipId = "zxoc-clip-" + seq;
+        // Ids must be unique across the DOCUMENT, not the visual: two Org Charts
+        // on one report page share a document (the lesson of OC-025). A counter,
+        // not a random value, so the markup stays deterministic for export.
+        this.chartId = "zxoc-chart-" + seq;
+        this.lensClipId = "zxoc-lens-" + seq;
         this.svg.append("defs").append("clipPath").attr("id", clipId).attr("class", "chart-clip")
             .append("rect").attr("x", 0).attr("y", 0).attr("width", 0).attr("height", 0);
         this.viewport = this.svg.append("g").attr("class", "chart-area").attr("clip-path", `url(#${clipId})`)
-            .append("g").attr("class", "viewport") as GSel;
+            .append("g").attr("class", "viewport").attr("id", this.chartId) as GSel;
         this.chrome = this.svg.append("g").attr("class", "chrome") as GSel;
+        this.mapLayer = this.svg.append("g").attr("class", "zx-minimap-layer") as GSel;
+        this.lensLayer = this.svg.append("g").attr("class", "zx-lens-layer")
+            .attr("pointer-events", "none") as GSel;
 
         // A press on the chart must dismiss the gear. d3-zoom stops the mousedown
         // immediately (that is how it claims the drag), so the bar's own
         // click-away listener on `document` never sees it — the visual has to say so.
-        this.zoom = createZoomPan(this.svg, this.viewport, () => this.updatePanHint(), () => {
+        this.zoom = createZoomPan(this.svg, this.viewport, () => {
+            this.updatePanHint();
+            // The window rectangle answers to the LIVE view, not to the last data
+            // render — the same reason the pan cue is its own element.
+            this.updateMinimap();
+            this.updateLens();
+        }, () => {
             // "Close on click-away" is the author's call. Before OC-028 this closed
             // the gear on every press on the chart, so switching it off did nothing
             // on the one surface it exists for.
@@ -329,7 +422,43 @@ export class Visual implements IVisual {
             try { this.landing.show(); } catch { /* the SVG landing is still underneath */ }
         }
 
+        /*
+         * The lens (OC-034). The pointer position is tracked on the svg itself
+         * rather than on the cards: the whole point is to magnify a region, and
+         * half of what is in it — connectors, the gaps that show a branch is
+         * wide — is not a card. Tracked only while the lens is ON, so a report
+         * that never turns it on pays nothing.
+         */
+        this.svg.on("mousemove.lens", (ev: MouseEvent) => {
+            if (!this.lensOn) return;
+            const node = this.svg.node() as SVGSVGElement | null;
+            if (!node || typeof node.getBoundingClientRect !== "function") return;
+            // Over the controls, the loupe stands down (OC-035). It is drawn on
+            // TOP of the chrome, so without this it covered the very button you
+            // reach for to turn it off — and the way out of the mode looked like
+            // there wasn't one. The loupe never takes a pointer event, so the
+            // event's target is the real element underneath it.
+            if (overChrome(ev.target)) {
+                this.lensPoint = null;
+                this.updateLens();
+                return;
+            }
+            const r = node.getBoundingClientRect();
+            this.lensPoint = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+            this.updateLens();
+        });
+        this.svg.on("mouseleave.lens", () => {
+            this.lensPoint = null;
+            this.updateLens();
+        });
+
         this.svg.on("keydown", (ev: KeyboardEvent) => {
+            // Escape puts the lens down — the way out of any transient mode.
+            if (ev.key === "Escape" && this.lensOn) {
+                ev.preventDefault();
+                this.setLens(false);
+                return;
+            }
             // Ctrl/Cmd+E exports. Still routed through exportChart(); a toolbar
             // affordance arrives with the overlay chrome.
             if ((ev.ctrlKey || ev.metaKey) && (ev.key === "e" || ev.key === "E")) {
@@ -346,9 +475,14 @@ export class Visual implements IVisual {
             } else if (ev.key === "-" || ev.key === "_") {
                 ev.preventDefault();
                 this.zoom.zoomBy(1 / ZOOM_STEP, vp);
-            } else if (ev.key === "0") {
+            } else if (ev.key === "0" && !ev.shiftKey) {
                 ev.preventDefault();
                 this.refit();
+            } else if (ev.key === ")" || (ev.key === "0" && ev.shiftKey)) {
+                // Shift+0 — "0, but all of it". Below the legibility floor if
+                // that is what showing the whole chart takes (OC-036).
+                ev.preventDefault();
+                this.fitAll();
             }
         });
     }
@@ -406,6 +540,8 @@ export class Visual implements IVisual {
                 // NoData passed further down (bound, but zero rows after filtering)
                 // is a different state and must NOT bring the carousel back.
                 this.setLandingVisible(reason === EmptyReason.NoData, palette.surface);
+                if (this.overlay) this.overlay.setLevels(0);
+                this.hideChartOverlays();
                 this.syncOverlay(w, h);
                 this.finish(options);
                 return;
@@ -419,6 +555,7 @@ export class Visual implements IVisual {
             if (model.nodes.length === 0) {
                 this.leaveAltViews();
                 this.renderLanding(EmptyReason.NoData, dataView, w, h, palette);
+                this.hideChartOverlays();
                 this.syncOverlay(w, h);
                 this.finish(options);
                 return;
@@ -433,6 +570,12 @@ export class Visual implements IVisual {
             const keys = model.nodes.map((n) => n.key);
             const parents = model.nodes.map((n) => n.parentKey);
             const hierarchy = buildHierarchy(keys, parents);
+            // The level ladder offers exactly the levels this hierarchy has.
+            if (this.overlay) {
+                let deepest = 0;
+                for (const d of hierarchy.depth) if (d > deepest) deepest = d;
+                this.overlay.setLevels(deepest + 1);
+            }
 
             // Restore persisted collapse state. Keys are the contract; indices
             // shift on every filter.
@@ -491,10 +634,14 @@ export class Visual implements IVisual {
             const fitK: FitScale = (l) => fitAvoiding(l.bounds, cardRects(l), fitBox, obstacles, 16, maxScale).k;
             // The scale at which the smallest drawn name is FLOOR_PX on screen.
             // Never above 1: an author who picks 7px names has chosen them.
-            const kFloor = Math.min(1, FLOOR_PX / Math.max(1, smallestNameSize(
+            const smallestName = Math.max(1, smallestNameSize(
                 this.settings.nodes.cardHeight.value, this.settings.labels.nameSize.value,
                 this.settings.labels.titleSize.value,
-            )));
+            ));
+            const kFloor = Math.min(1, FLOOR_PX / smallestName);
+            // What the OPENING view aims at, which is deliberately above the floor
+            // (OC-035). Never above 1: an author who picks 7px names chose them.
+            const kOpen = Math.min(1, OPEN_PX / smallestName);
             const leafMode = String(this.settings.layout.leafStack.value.value || "auto") as LeafMode;
             const arrange = arrangeFor(hierarchy, layoutOptions, fitK, leafMode, kFloor);
 
@@ -503,15 +650,53 @@ export class Visual implements IVisual {
             // a 169-person org is a 9% slice of its middle — technically fitted,
             // and useless. Runs once per report: after that the stored collapse
             // state is the user's, and re-applying this would fight them.
-            if (this.settings.layout.collapseToFit.value
+            /*
+             * ⚠️ "Collapse deep levels to fit" is an INSTRUCTION, not only an
+             * opening behaviour (OC-037).
+             *
+             * It used to run once per report and then never again, so after the
+             * first render the switch did nothing in either direction — a author
+             * flipping it watched a dead control, which is the defect this
+             * product is positioned against. The reason for "once per report"
+             * was never the switch: it was that RE-APPLYING on every refresh
+             * would fight a reader who had expanded a branch by hand. Acting on
+             * the author's flip is the opposite of that, and the flag still stops
+             * any re-application between flips.
+             */
+            const ctfOn = this.settings.layout.collapseToFit.value;
+            const ctfFlipped = this.lastCollapseToFit !== null && this.lastCollapseToFit !== ctfOn;
+            this.lastCollapseToFit = ctfOn;
+            const firstAuto = ctfOn
                 && !this.settings.layout.collapseToFitDone.value
                 && !this.autoFitApplied
-                && this.collapsedKeys.size === 0) {
+                && this.collapsedKeys.size === 0;
+
+            if (ctfFlipped && !ctfOn) {
+                // Turned OFF: don't collapse to fit — so show every level. The
+                // switch is reversible, and the note in the gear says as much.
                 this.autoFitApplied = true;
-                // Aimed at the legibility floor, with stacking and wrapping chosen
-                // per level (they change what fits), and free to stop at the
-                // roots when not even the first level is readable (OC-030).
-                const depth = depthThatFits(hierarchy, layoutOptions, fitBox, kFloor, fitK, arrange);
+                this.collapsedKeys.clear();
+                this.persistCollapsed(keys, true, LAST_LEVEL);
+            } else if (firstAuto || (ctfFlipped && ctfOn)) {
+                this.autoFitApplied = true;
+                // Turned ON: "collapse to fit" means exactly that, so start from
+                // the whole tree rather than from whatever is folded now.
+                if (ctfFlipped) this.collapsedKeys.clear();
+                // Aimed at `kOpen` — a COMFORTABLE size, not the bare floor
+                // (OC-035) — with stacking and wrapping chosen per level (they
+                // change what fits), and free to stop at the roots when not even
+                // the first level is readable (OC-030).
+                let depth = depthThatFits(hierarchy, layoutOptions, fitBox, kOpen, fitK, arrange);
+                /*
+                 * Comfort may fold a level the floor would have kept — that IS the
+                 * point — but it must never fold the chart down to the bare roots.
+                 * A wide, shallow org whose one row of reports is merely tight
+                 * would otherwise open as a single card, which shows nothing.
+                 * Only the FLOOR may go that far (OC-030), so ask it instead.
+                 */
+                if (depth !== NO_COLLAPSE && depth < 1) {
+                    depth = depthThatFits(hierarchy, layoutOptions, fitBox, kFloor, fitK, arrange);
+                }
                 if (depth !== NO_COLLAPSE) {
                     for (let i = 0; i < keys.length; i++) {
                         if (hierarchy.depth[i] === depth && isParentNode(hierarchy, i)) {
@@ -519,7 +704,14 @@ export class Visual implements IVisual {
                         }
                     }
                 }
-                this.persistCollapsed(keys, true);
+                // Tell the level ladder what it just did, so Layout → Levels shows
+                // the view the reader is looking at rather than ten switches all
+                // claiming to be on (OC-035).
+                this.persistCollapsed(keys, true, depth === NO_COLLAPSE ? LAST_LEVEL : depth + 1);
+            } else {
+                // The author moved the ladder: apply it ONCE, then leave the
+                // collapse set alone so a branch opened by hand is not overruled.
+                this.applyLevelLadder(hierarchy, keys);
             }
 
             const collapsed = new Set<number>();
@@ -566,6 +758,17 @@ export class Visual implements IVisual {
                 bounds: layout.bounds, width: fitBox.width, height: fitBox.height, maxScale,
                 minScale: kFloor, anchor: rootsBox(hierarchy, layout),
             };
+            /*
+             * Does "Show everything" say anything "Fit to view" does not?
+             * Only when the readable fit is a CROP — then the two are different
+             * answers, one legible and one complete, and the bar offers both
+             * (OC-036). On a chart that fits whole they would do the same thing,
+             * and a button that duplicates its neighbour is the dead control
+             * this product is positioned against.
+             */
+            this.fullViewDiffers = fitAvoiding(
+                layout.bounds, cardRects(layout), fitBox, obstacles, 16, maxScale, kFloor,
+            ).floored;
             this.svg.select("clipPath.chart-clip rect").attr("width", w).attr("height", Math.max(0, fitBox.height));
             this.lastCards = cardRects(layout);
             this.lastLayout = layout;
@@ -586,6 +789,10 @@ export class Visual implements IVisual {
                 this.settings.toolbar.position.value.value, this.allowInteractions,
                 this.settings.summaryTable.show.value, this.settings.insights.show.value,
                 this.settings.summaryTable.position.value.value,
+                // The quick-action bar's height depends on how many buttons it
+                // holds, and its box is an obstacle — so it belongs here too.
+                this.settings.toolbar.actions.value, this.settings.toolbar.actionsPosition.value.value,
+                this.settings.toolbar.lens.value,
             ].join("|");
             if (signature !== this.viewSignature || !this.zoom || !this.zoom.touched()) {
                 this.viewSignature = signature;
@@ -745,9 +952,13 @@ export class Visual implements IVisual {
                 renderLegend(this.chrome, {
                     items,
                     x: band.x,
-                    // Stop short of the zoom controls rather than run under them,
-                    // and start/stop clear of a gear pinned to a bottom corner.
-                    maxWidth: Math.max(0, Math.min(w - 10 - (CONTROL_SIZE + 24), band.right) - band.x),
+                    // `rowSpan` already steps clear of every piece of chrome in
+                    // this row — the gear, the view switch and, since OC-034, the
+                    // quick-action bar wherever the author put it. The old
+                    // hard-coded right margin assumed the bar was always
+                    // bottom-right and shortened the legend for no reason
+                    // whenever it was not.
+                    maxWidth: Math.max(0, band.right - band.x),
                     y: legendY,
                     fontPx: 11,
                     fg: surface.muted,
@@ -782,6 +993,10 @@ export class Visual implements IVisual {
             // buttons live there so the fit transform never moves them.
             this.renderZoomControls(w, h, palette);
             this.renderPanHint(w, h, surface.muted);
+            // Both live in layers of their own, so neither is cleared by the
+            // status line — and both answer to the live transform.
+            this.updateMinimap();
+            this.updateLens();
             this.syncOverlay(w, h);
             this.reportDataQuality(model, hierarchy, keys, parents);
             this.finish(options);
@@ -1039,11 +1254,76 @@ export class Visual implements IVisual {
 
     /* ── the view switch (OC-029) ─────────────────────────────────────────── */
 
-    /** The corner the gear occupies, or null when it is not drawn. */
+    /**
+     * The corner the gear occupies, or null when it is not drawn.
+     *
+     * ⚠️ Auto is BOTTOM-RIGHT since OC-034 (CEO, 2026-09-20). OC-020 had moved it
+     * to top-right; the quick-action bar now owns that corner, and the gear sits
+     * with the view switch in the bottom one. Read `GEAR_AUTO_CORNER`, never a
+     * literal — three call sites used to carry "tr" separately and one of them
+     * (`syncOverlay`) ignored the setting altogether.
+     */
     private gearCorner(): string | null {
         if (!this.overlay || !this.settings.toolbar.show.value || !this.allowInteractions) return null;
         const pref = String(this.settings.toolbar.position.value.value || "auto");
-        return pref === "auto" ? "tr" : pref;
+        return pref === "auto" ? GEAR_AUTO_CORNER : pref;
+    }
+
+    /** The corner the quick-action bar occupies, or null when it is not drawn. */
+    private actionCorner(): ActionCorner | null {
+        if (!this.zoom || !this.allowInteractions) return null;
+        if (this.settings.toolbar.actions.value === false) return null;
+        const pref = String(this.settings.toolbar.actionsPosition.value.value || "tr");
+        return (pref === "tl" || pref === "bl" || pref === "br" ? pref : "tr") as ActionCorner;
+    }
+
+    /** The corner at the other end of the same column. */
+    private static opposite(corner: string): string {
+        return (corner.charAt(0) === "t" ? "b" : "t") + corner.charAt(1);
+    }
+
+    /** True when the gear or the view switch already sits in `corner`. */
+    private cornerTaken(corner: string): boolean {
+        if (this.gearCorner() === corner) return true;
+        return this.pillBox() !== null && this.pillCorner === corner;
+    }
+
+    /**
+     * The quick-action bar's box, from the SAME geometry the renderer uses.
+     *
+     * The gear and the pill are 36px tall and sit side by side when they share a
+     * corner, so one clearance covers both — the bar steps past that band, not
+     * past each piece in turn.
+     */
+    private actionBarBox(): ScreenRect | null {
+        const corner = this.actionCorner();
+        if (!corner || !this.lastOptions) return null;
+        const vp = this.lastOptions.viewport;
+        /*
+         * The obstacle reserves the bar at its LARGEST — five buttons whenever
+         * they could be wanted — rather than at the size being drawn right now.
+         *
+         * "Show everything" appears only when the readable fit is a crop, and
+         * whether it is a crop is decided BY the fit this obstacle feeds. Asking
+         * the live answer made the fit one render stale: a card was drawn under a
+         * bar that had grown since (found by the COVER gate at 640×400). Over-
+         * reserving by one button is the same trade the minimap makes.
+         */
+        const plan = planActionBar({
+            width: vp.width,
+            height: vp.height,
+            corner,
+            lens: this.lensOffered(),
+            fullView: true,
+            cornerInset: this.cornerTaken(corner) ? GEAR_CLEARANCE : 0,
+            farInset: this.cornerTaken(Visual.opposite(corner)) ? GEAR_CLEARANCE : 0,
+        });
+        return plan ? plan.rect : null;
+    }
+
+    /** Whether the lens button is drawn at all. */
+    private lensOffered(): boolean {
+        return this.settings.toolbar.lens.value !== false && this.allowInteractions;
     }
 
     /**
@@ -1078,7 +1358,7 @@ export class Visual implements IVisual {
         vt.setCompact(w < 560);
         vt.show();
         const pref = String(s.summaryTable.position.value.value || "auto");
-        const corner = pref === "auto" ? "tr" : pref;
+        const corner = pref === "auto" ? GEAR_AUTO_CORNER : pref;
         this.pillCorner = corner;
         const pw = vt.width();
         const beside = this.gearCorner() === corner ? 36 + 8 : 0;
@@ -1093,9 +1373,9 @@ export class Visual implements IVisual {
         return this.viewToggle && this.viewToggle.isShown() ? this.pillRect : null;
     }
 
-    /** True when the zoom stack's bottom-right corner is taken — by the gear or the pill. */
+    /** True when the bottom-right corner is taken — by the gear or the pill. */
     private bottomRightTaken(): boolean {
-        return this.gearAtBottomRight() || (this.pillBox() !== null && this.pillCorner === "br");
+        return this.cornerTaken("br");
     }
 
     /**
@@ -1111,6 +1391,8 @@ export class Visual implements IVisual {
         const root = this.root;
         if (!root) return;
         const kind = this.viewMode;
+        // The chart is not on screen, so neither is the thumbnail of it.
+        this.hideChartOverlays();
         // A host update rebuilds the view; keep the reader where they were in it.
         const prevScroll = this.altEl && this.altKind === kind ? this.altEl.scrollTop : 0;
         this.removeAltView();
@@ -1203,6 +1485,13 @@ export class Visual implements IVisual {
         }
         this.altKind = kind;
         if (prevScroll) this.altEl.scrollTop = prevScroll;
+    }
+
+    /** Chart-only chrome, down: the landing page and the alternate views own the canvas. */
+    private hideChartOverlays(): void {
+        if (this.mapLayer) clearMinimap(this.mapLayer);
+        if (this.lensLayer) clearLens(this.lensLayer);
+        this.lensPoint = null;
     }
 
     private removeAltView(): void {
@@ -1357,19 +1646,185 @@ export class Visual implements IVisual {
      * as much a decision as "this one did not", and re-deciding it on every
      * refresh would re-collapse a tree the user had opened up.
      */
-    private persistCollapsed(keys: string[], markAutoDone = false): void {
+    /**
+     * @param setLadder when given, the level ladder is rewritten to show exactly
+     *                  this many levels — what the automatic collapse just chose.
+     *                  Written in the SAME merge as the collapse state: two
+     *                  synchronous `persistProperties` calls are coalesced by the
+     *                  host and all but the last are lost.
+     */
+    private persistCollapsed(keys: string[], markAutoDone = false, setLadder?: number): void {
         const idx = new Set<number>();
         for (let i = 0; i < keys.length; i++) if (this.collapsedKeys.has(keys[i])) idx.add(i);
         const properties: Record<string, string | boolean> = {
             collapsed: serializeCollapsed(keys, idx),
         };
         if (markAutoDone) properties.collapseToFitDone = true;
+        if (setLadder !== undefined) {
+            // What the switches said before this rewrite — how a stale update
+            // that races the write is recognised (see `applyLevelLadder`).
+            this.prevLadder = levelLadder(this.settings);
+            const ladder = Visual.ladderString(setLadder);
+            for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) {
+                properties[`level${n}`] = ladder.charAt(n - FIRST_LEVEL) === "1";
+            }
+            properties.levelsApplied = ladder;
+            this.writeLadderLocal(ladder);
+            this.lastLadder = ladder;
+            this.pendingLadder = ladder;
+        }
         this.pendingCollapsed = properties.collapsed as string;
         this.host.persistProperties({
             merge: [{
                 objectName: "layout",
                 selector: null,
                 properties,
+            }],
+        });
+    }
+
+    /* ── the per-level ladder (OC-035) ──────────────────────────────────── */
+
+    /** The ladder string for "show N levels". */
+    private static ladderString(shown: number): string {
+        let out = "";
+        for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) out += n <= shown ? "1" : "0";
+        return out;
+    }
+
+    /**
+     * Move the switches to `to` without touching the chart — the gear catching
+     * up with a view that changed under it. The collapse state is NOT written:
+     * it is already what it is, and this is only the label on it.
+     */
+    private syncLadder(to: string, from: string): void {
+        this.prevLadder = from;
+        this.lastLadder = to;
+        this.pendingLadder = to;
+        this.writeLadderLocal(to);
+        const properties: Record<string, string | boolean> = { levelsApplied: to };
+        for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) {
+            properties[`level${n}`] = to.charAt(n - FIRST_LEVEL) === "1";
+        }
+        this.host.persistProperties({
+            merge: [{ objectName: "layout", selector: null, properties }],
+        });
+    }
+
+    /** Write a ladder string onto the model's switches, without persisting. */
+    private writeLadderLocal(ladder: string): void {
+        const lay = this.settings.layout as unknown as Record<string, { value: boolean | string }>;
+        for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) {
+            lay[`level${n}`].value = ladder.charAt(n - FIRST_LEVEL) === "1";
+        }
+        this.settings.layout.levelsApplied.value = ladder;
+    }
+
+    /**
+     * Apply the per-level ladder — once, when the AUTHOR moves it.
+     *
+     * The switches are an instruction, not a running constraint. Enforcing them
+     * on every render would re-fold a branch the reader had just clicked open —
+     * the mistake `collapseToFitDone` exists to avoid, and the one that makes a
+     * ceiling-style design unusable here.
+     *
+     * Telling "the author moved a switch" from "the host has not echoed our own
+     * write yet" is the same three-case problem `collapsed` has (OC-029,
+     * zentrix-org-chart#3). `levelsApplied` travels in the SAME merge as the
+     * switches and the collapse state, so:
+     *   • it equals our unconfirmed write → the host confirmed it;
+     *   • it changed some other way       → a bookmark, Undo, another author's
+     *     save. Its collapse state came with it, so adopt and change nothing;
+     *   • the switches came back as they were BEFORE our write → a stale update
+     *     that raced it. Keep showing ours.
+     * Anything else is a move, including a second move before the first is
+     * echoed — blocking on `pending` alone wedged the ladder after one change
+     * on any host that does not store (found by probe, jsdom + the gate sweep).
+     */
+    private applyLevelLadder(h: Hierarchy, keys: string[]): void {
+        const hostApplied = this.settings.layout.levelsApplied.value || "";
+
+        if (this.pendingLadder !== null && hostApplied === this.pendingLadder) {
+            this.pendingLadder = null;
+            this.lastHostLadder = hostApplied;
+            this.lastLadder = hostApplied;
+        } else if (this.lastHostLadder !== null && hostApplied !== this.lastHostLadder
+            && this.pendingLadder === null) {
+            // Restored from outside, with its own collapse state. Adopt it.
+            this.lastHostLadder = hostApplied;
+            if (hostApplied !== "") {
+                this.lastLadder = hostApplied;
+                this.writeLadderLocal(hostApplied);
+            }
+            return;
+        }
+        if (this.lastHostLadder === null) this.lastHostLadder = hostApplied;
+
+        const ladder = levelLadder(this.settings);
+        if (this.pendingLadder !== null) {
+            // Our write, not yet back: nothing new to do.
+            if (ladder === this.pendingLadder) return;
+            // The switches came back as they were before it — a stale update
+            // racing the write. Keep ours on screen rather than undoing it.
+            if (ladder === this.prevLadder) { this.writeLadderLocal(this.pendingLadder); return; }
+            // Otherwise the author moved it again. Fall through.
+        }
+
+        /*
+         * What the CHART is showing, when the ladder can say it. A collapse set
+         * that folds one branch and not its siblings is a fine view and a bad
+         * ladder, so `uniformLevelsShown` returns null there and the switches
+         * keep the author's last instruction rather than being rewritten.
+         */
+        const folded = new Set<number>();
+        for (let i = 0; i < keys.length; i++) {
+            if (this.collapsedKeys.has(keys[i]) && isParentNode(h, i)) folded.add(i);
+        }
+        const actual = uniformLevelsShown(h, folded, LAST_LEVEL);
+        const truth = actual === null ? null : Visual.ladderString(actual);
+
+        // First sight in this session: the stored collapse state is the author's
+        // and outranks a default nobody touched — so the CHART is the truth and
+        // the switches are made to say so.
+        if (this.lastLadder === null) {
+            this.lastLadder = ladder;
+            if (truth !== null && truth !== ladder) this.syncLadder(truth, ladder);
+            return;
+        }
+        if (ladder === this.lastLadder) {
+            // The switches have not moved, but the chart may have — a branch
+            // folded or opened by hand, or a collapse state restored from the
+            // report. Keep the gear honest about what is on screen.
+            if (truth !== null && truth !== ladder) this.syncLadder(truth, ladder);
+            return;
+        }
+
+        /*
+         * The author moved it. "Show N levels" means every parent shallower than
+         * level N is open and every parent ON level N is folded; anything deeper
+         * is already hidden and is left exactly as the reader left it, so
+         * expanding back out restores the shape they had.
+         */
+        this.prevLadder = this.lastLadder;
+        this.lastLadder = ladder;
+        this.pendingLadder = ladder;
+        const foldAt = levelsShown(ladder) - 1;         // 0-based depth whose children go
+        for (let i = 0; i < keys.length; i++) {
+            if (!isParentNode(h, i)) continue;
+            if (h.depth[i] < foldAt) this.collapsedKeys.delete(keys[i]);
+            else if (h.depth[i] === foldAt) this.collapsedKeys.add(keys[i]);
+        }
+        const idx = new Set<number>();
+        for (let i = 0; i < keys.length; i++) if (this.collapsedKeys.has(keys[i])) idx.add(i);
+        const collapsed = serializeCollapsed(keys, idx);
+        this.pendingCollapsed = collapsed;
+        this.settings.layout.levelsApplied.value = ladder;
+        // ONE merge. Two synchronous `persistProperties` calls are coalesced by
+        // the host and all but the last are dropped.
+        this.host.persistProperties({
+            merge: [{
+                objectName: "layout", selector: null,
+                properties: { collapsed, levelsApplied: ladder },
             }],
         });
     }
@@ -1512,24 +1967,24 @@ export class Visual implements IVisual {
     /**
      * Hand the gear this render's settings, theme and corner.
      *
-     * The gear pins top-RIGHT whenever its position is Auto (CEO, 2026-09-12).
-     * Note the divergence: the Sankey and the Network Graph both pin bottom-right,
-     * each citing an earlier CEO call — if the family is meant to move, they move
-     * too, and this comment is the thread to pull. It is hidden on a viewport too
-     * small to hold it without covering the chart.
+     * ⚠️ Before OC-034 this passed the literal `"tr"`, so **the Gear position
+     * setting did nothing** — `gearCorner()` reported the author's corner to the
+     * fit and the rows while the gear itself stayed top-right, and the two
+     * disagreed. It now asks `gearCorner()`, which is the one place the Auto
+     * corner is decided. Hidden on a viewport too small to hold it without
+     * covering the chart.
      */
     private syncOverlay(w: number, h: number): void {
         if (!this.overlay) return;
         const tooSmall = w < 220 || h < 160;
         this.overlay.update(this.settings, false, tooSmall || !this.allowInteractions);
-        this.overlay.setCorner("tr");
+        const pref = String(this.settings.toolbar.position.value.value || "auto");
+        this.overlay.setCorner(pref === "auto" ? GEAR_AUTO_CORNER : pref);
     }
 
-    /** True when the gear occupies the bottom-right corner the zoom stack uses. */
+    /** True when the gear occupies the bottom-right corner. */
     private gearAtBottomRight(): boolean {
-        if (!this.overlay || !this.settings.toolbar.show.value || !this.allowInteractions) return false;
-        // Auto is top-right now, so only an explicit "br" shares the corner.
-        return String(this.settings.toolbar.position.value.value || "auto") === "br";
+        return this.gearCorner() === "br";
     }
 
     /**
@@ -1573,15 +2028,23 @@ export class Visual implements IVisual {
         this.chrome.selectAll<SVGTextElement, unknown>("text.status-line").attr("opacity", cropped ? 0 : 1);
     }
 
-    /** Zoom in / out / fit, bottom-right. Free tier — usability is not a feature. */
+    /**
+     * The quick-action bar: zoom in / out / fit / lens. Free tier — usability is
+     * not a feature. Top-right by default since OC-034, and the author may move it.
+     */
     private renderZoomControls(w: number, h: number, palette: ResolvedPalette): void {
-        if (!this.zoom || !this.allowInteractions) return;
+        if (!this.zoom) return;
+        const corner = this.actionCorner();
+        if (!corner) return;
         const s = palette.surface;
         renderZoomControls(this.chrome, {
             width: w,
             height: h,
-            // Stack above the gear (or the view switch) rather than on top of it.
-            bottomInset: this.bottomRightTaken() ? GEAR_CLEARANCE : 0,
+            corner,
+            // Step past the gear / view-switch band rather than draw on top of it.
+            cornerInset: this.cornerTaken(corner) ? GEAR_CLEARANCE : 0,
+            // …and clear of whatever holds the other end of the same column.
+            farInset: this.cornerTaken(Visual.opposite(corner)) ? GEAR_CLEARANCE : 0,
             fg: s.fg,
             bg: palette.highContrast ? s.bg : "#FFFFFF",
             stroke: s.cardStroke,
@@ -1593,7 +2056,158 @@ export class Visual implements IVisual {
             onZoomIn: () => this.zoom && this.zoom.zoomBy(ZOOM_STEP, { width: w, height: h }),
             onZoomOut: () => this.zoom && this.zoom.zoomBy(1 / ZOOM_STEP, { width: w, height: h }),
             onFit: () => this.refit(),
+            fullView: {
+                show: this.fullViewDiffers,
+                label: this.loc.get("Zoom_All"),
+                onClick: () => this.fitAll(),
+            },
+            lens: {
+                show: this.lensOffered(),
+                active: this.lensOn,
+                // The label is the way OUT while the lens is on: a mode with no
+                // visible exit is what made this feel like a trap (OC-035).
+                label: this.loc.get(this.lensOn ? "Lens_Off" : "Lens_Toggle"),
+                accent: palette.highContrast ? s.selected : accent,
+                onToggle: () => this.setLens(!this.lensOn),
+            },
         });
+    }
+
+    /* ── the lens (OC-034) ─────────────────────────────────────────────────
+     *
+     * A loupe that follows the pointer. It exists because the opening fit stops
+     * at the legibility floor but a READER may zoom out past it — only `−` and
+     * the wheel go below the floor — and on a large hierarchy "everything at
+     * once" means cards a few pixels wide. Session-local: a reader cannot
+     * persist a property, so this is state, not a setting.
+     */
+
+    /** Turn the lens on or off and repaint the button that says so. */
+    private setLens(on: boolean): void {
+        if (this.lensOn === on) return;
+        this.lensOn = on;
+        if (!on) this.lensPoint = null;
+        // The branded hover card and the loupe would fight over the same pointer.
+        if (on && this.overlayTooltip) this.overlayTooltip.hide();
+        try { this.svg.classed("zx-lens-active", on); } catch { /* jsdom without classed */ }
+        this.updateLens();
+        if (this.palette && this.lastOptions) {
+            const vp = this.lastOptions.viewport;
+            this.renderZoomControls(vp.width, vp.height, this.palette);
+        }
+    }
+
+    /** Draw the loupe where the pointer is, or take it down. */
+    private updateLens(): void {
+        if (!this.lensLayer) return;
+        const p = this.lensPoint;
+        const vp = this.lastOptions ? this.lastOptions.viewport : null;
+        if (!this.lensOn || !p || !vp || !this.palette || !this.zoom
+            || this.viewMode !== "chart" || !this.allowInteractions) {
+            clearLens(this.lensLayer);
+            return;
+        }
+        const surface = this.palette.surface;
+        try {
+            renderLens(this.lensLayer, this.lensClipId, {
+                px: p.x, py: p.y,
+                width: vp.width, height: vp.height,
+                k: this.zoom.current().k,
+                chartId: this.chartId,
+                bg: this.palette.highContrast ? surface.bg : "#FFFFFF",
+                fg: surface.fg,
+                stroke: surface.cardStroke,
+                accent: this.palette.highContrast ? surface.fg : accent,
+                label: (times) => this.loc.fmt("Lens_Times", times),
+                exitLabel: this.loc.get("Lens_Exit"),
+            });
+        } catch {
+            // A magnifier must never be the reason a report shows a broken chart.
+            clearLens(this.lensLayer);
+        }
+    }
+
+    /* ── the minimap (OC-034) ──────────────────────────────────────────── */
+
+    /** Where the thumbnail goes, or null when it is off / there is no room. */
+    private minimapRect(): ScreenRect | null {
+        if (!this.lastOptions || !this.allowInteractions) return null;
+        if (this.settings.minimap.show.value === false) return null;
+        if (this.viewMode !== "chart") return null;
+        const vp = this.lastOptions.viewport;
+        // The legend and the status line own the last rows; the thumbnail sits
+        // above that band, never in it.
+        const legendOn = this.settings.overlays.showLegend.value
+            && String(this.settings.colors.colorMode.value.value) !== "single";
+        const bottomBand = 22 + (legendOn ? LEGEND_HEIGHT : 0);
+        // Whichever bottom corner the gear and the pill left alone; if they took
+        // both, step above the one on the left.
+        const corner: "bl" | "br" = this.cornerTaken("bl") && !this.cornerTaken("br") ? "br" : "bl";
+        const shared = this.cornerTaken(corner) || this.actionCorner() === corner;
+        return minimapBox({
+            width: vp.width,
+            height: vp.height,
+            bottomBand,
+            corner,
+            cornerInset: shared ? GEAR_CLEARANCE : 0,
+        });
+    }
+
+    /**
+     * Draw the thumbnail, or take it down.
+     *
+     * Hidden while the whole chart is on screen: with nothing off the edge the
+     * window rectangle would fill the box and say nothing. It appears the moment
+     * the view becomes a crop — which is the question it answers — and the space
+     * it needs is reserved either way (`chromeObstacles`), so it never reflows
+     * the chart by appearing.
+     */
+    private updateMinimap(): void {
+        if (!this.mapLayer) return;
+        const box = this.minimapRect();
+        const vp = this.lastOptions ? this.lastOptions.viewport : null;
+        if (!box || !vp || !this.palette || !this.zoom || !this.lastFit || !this.lastCards.length) {
+            clearMinimap(this.mapLayer);
+            return;
+        }
+        const t = this.zoom.current();
+        const content = this.lastFit.bounds;
+        if (showsEverything(visibleBounds(t, vp.width, vp.height), content)) {
+            clearMinimap(this.mapLayer);
+            return;
+        }
+        const surface = this.palette.surface;
+        try {
+            renderMinimap(this.mapLayer, {
+                box,
+                cards: this.lastCards,
+                content,
+                transform: t,
+                width: vp.width,
+                height: vp.height,
+                bg: this.palette.highContrast ? surface.bg : "#FFFFFF",
+                fg: surface.fg,
+                muted: surface.muted,
+                stroke: surface.cardStroke,
+                accent: this.palette.highContrast ? surface.fg : accent,
+                highContrast: this.palette.highContrast,
+                label: this.loc.get("Minimap_Label"),
+                interactive: this.allowInteractions,
+                onGoTo: (x, y) => this.centreOn(x, y),
+            });
+        } catch {
+            clearMinimap(this.mapLayer);
+        }
+    }
+
+    /** Put a LAYOUT point in the middle of the canvas, keeping the scale. */
+    private centreOn(x: number, y: number): void {
+        if (!this.zoom || !this.lastOptions) return;
+        const vp = this.lastOptions.viewport;
+        const t = this.zoom.current();
+        this.zoom.apply({ k: t.k, tx: vp.width / 2 - x * t.k, ty: vp.height / 2 - y * t.k });
+        // A deliberate move, so the next update must not snap the reader back.
+        this.zoom.markTouched();
     }
 
     /* ── colours: the one durable path ────────────────────────────────────
@@ -1688,6 +2302,13 @@ export class Visual implements IVisual {
         this.maybePersistColors();          // rewrite the (now default) colour blob
         this.collapsedKeys.clear();
         this.autoFitApplied = false;
+        this.lastCollapseToFit = null;
+        // The ladder went back to its default with everything else; forgetting
+        // what was applied lets the fresh automatic collapse own the view again.
+        this.lastLadder = null;
+        this.pendingLadder = null;
+        this.lastHostLadder = null;
+        this.prevLadder = null;
         this.viewSignature = "";
         if (this.zoom) this.zoom.clearTouched();
     }
@@ -1804,6 +2425,34 @@ export class Visual implements IVisual {
     }
 
     /**
+     * "Show everything" — the whole chart, at whatever scale that takes (OC-036).
+     *
+     * `refit` stops at the legibility floor, which since OC-030 means a large
+     * hierarchy fits to a READABLE CROP rather than to the whole tree. That is
+     * the right default and the wrong answer to "let me see all of it", which
+     * until now could only be had by holding `−`. This is the same
+     * chrome-aware fit with the floor taken off, so nothing lands under the
+     * controls; the lens is how a card is read once here.
+     */
+    private fitAll(): void {
+        if (!this.lastFit || !this.zoom) return;
+        const t = fitAvoiding(
+            this.lastFit.bounds,
+            this.lastCards,
+            { width: this.lastFit.width, height: this.lastFit.height },
+            this.chromeObstacles(this.lastFit.width, this.lastFit.height),
+            16,
+            this.lastFit.maxScale,
+            0,                                   // no floor: everything, or nothing
+            this.lastFit.anchor,
+        );
+        this.zoom.apply({ k: t.k, tx: t.tx, ty: t.ty });
+        // A deliberate move below the floor, so the next update must not snap the
+        // reader back to the readable fit they just chose to leave.
+        this.zoom.markTouched();
+    }
+
+    /**
      * Where the COLLAPSED gear button sits, in viewport pixels; null when hidden or
      * unmeasurable.
      *
@@ -1843,8 +2492,11 @@ export class Visual implements IVisual {
      */
     private rowSpan(y0: number, y1: number, w: number): { x: number; right: number } {
         let x = 10, right = w - 10;
-        // The gear and, since OC-029, the view switch — whichever share this row.
-        for (const g of [this.gearBox(), this.pillBox()]) {
+        // The gear, the view switch (OC-029), and since OC-034 the quick-action
+        // bar and the thumbnail — whichever of them share this row. Before
+        // OC-034 the bar was assumed bottom-right and left out; pinned top-left
+        // it sat on the search box.
+        for (const g of [this.gearBox(), this.pillBox(), this.actionBarBox(), this.minimapRect()]) {
             if (g && g.y < y1 && g.y + g.h > y0) {
                 if (g.x + g.w / 2 < w / 2) x = Math.max(x, g.x + g.w + 8);
                 else right = Math.min(right, g.x - 8);
@@ -1891,17 +2543,22 @@ export class Visual implements IVisual {
                 if (gear) clip(gear);
             } catch { /* measuring is best effort; the chart still fits */ }
         }
-        // The view switch is placed by us, so its box is known without measuring.
+        // The view switch, the quick-action bar and the thumbnail are all placed
+        // by US, so their boxes are known without measuring — and since OC-034
+        // each comes from the one function that also draws it. The bar's box used
+        // to be re-derived here from copies of the renderer's constants.
         const pill = this.pillBox();
         if (pill) clip(pill);
-        if (this.zoom && this.allowInteractions && this.lastOptions) {
-            const vw = this.lastOptions.viewport.width, vh = this.lastOptions.viewport.height;
-            const inset = this.bottomRightTaken() ? GEAR_CLEARANCE : 0;
-            if (vw >= 200 && vh >= 140 + inset) {
-                const total = CONTROL_SIZE * 3 + 4 * 2;
-                clip({ x: vw - 10 - CONTROL_SIZE, y: vh - 10 - total - 14 - inset, w: CONTROL_SIZE, h: total });
-            }
-        }
+        const bar = this.actionBarBox();
+        if (bar) clip(bar);
+        /*
+         * The thumbnail reserves its corner whether or not it is on screen this
+         * instant. It appears only once the view is a crop, and a crop is decided
+         * BY this fit — reserving the space unconditionally is what keeps the
+         * chart from reflowing the moment the reader zooms in.
+         */
+        const map = this.minimapRect();
+        if (map) clip(map);
         return out;
     }
 

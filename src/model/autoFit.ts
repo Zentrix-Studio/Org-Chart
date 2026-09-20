@@ -104,6 +104,46 @@ export function depthThatFits(
     return NO_COLLAPSE;
 }
 
+/**
+ * How many levels the CHART is actually showing, when that is something the
+ * per-level ladder can say — otherwise `null` (OC-035).
+ *
+ * The ladder can only express "everything below level N is folded". A collapse
+ * set that folds one branch and not its siblings is a perfectly good view and a
+ * perfectly bad ladder, so it returns `null` and the switches are left as the
+ * author's last instruction rather than rewritten into a lie.
+ *
+ * Uniform means: every parent at one depth is folded and no parent above it is.
+ * Nothing folded at all is uniform too — that is "every level shown".
+ *
+ * @returns levels shown (1 = the roots alone), or null when the shape does not fit.
+ */
+export function uniformLevelsShown(
+    h: Hierarchy, collapsed: ReadonlySet<number>, maxLevels: number,
+): number | null {
+    const n = h.depth.length;
+    let foldAt = -1;
+    for (let i = 0; i < n; i++) {
+        if (!collapsed.has(i)) continue;
+        if (foldAt < 0 || h.depth[i] < foldAt) foldAt = h.depth[i];
+    }
+    if (foldAt < 0) return maxLevels;                      // nothing folded
+    // Every parent at that depth must be folded, and nothing deeper may be the
+    // only thing folded in its branch — otherwise the fold is per-branch.
+    for (let i = 0; i < n; i++) {
+        const isParent = h.children[i].length > 0;
+        if (!isParent) continue;
+        if (h.depth[i] === foldAt && !collapsed.has(i)) return null;
+        if (h.depth[i] > foldAt && collapsed.has(i)) {
+            // Deeper folds are hidden anyway; they only break uniformity if
+            // their branch is visible, which it cannot be below `foldAt`.
+            continue;
+        }
+        if (h.depth[i] < foldAt && collapsed.has(i)) return null;
+    }
+    return Math.min(maxLevels, foldAt + 1);
+}
+
 /** How leaf reports are laid out: "Leaf reports" in Layout. */
 export type LeafMode = "auto" | "row" | "stacked";
 

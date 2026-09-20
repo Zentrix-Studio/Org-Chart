@@ -70,13 +70,57 @@ class LayoutCard extends FormattingSettingsCard {
         value: true,
     });
 
-    /** Open a hierarchy too big to show whole with its deep levels collapsed,
-     *  rather than on an unreadable slice. Turning it off stops FUTURE
-     *  auto-collapses; it never expands what is already collapsed. */
+    /**
+     * Open a hierarchy too big to show whole with its deep levels collapsed,
+     * rather than on an unreadable slice.
+     *
+     * ⚠️ It is an INSTRUCTION, not only an opening behaviour (OC-037): flipping
+     * it ON collapses to fit there and then, flipping it OFF shows every level.
+     * Before that it ran once per report and the switch was dead from the second
+     * render on. What it still never does is re-apply ITSELF on a refresh — that
+     * would fight a reader who had expanded a branch by hand, which is what
+     * `collapseToFitDone` is for.
+     */
     collapseToFit = new formattingSettings.ToggleSwitch({
         name: "collapseToFit",
         displayName: "Collapse deep levels to fit",
         value: true,
+    });
+
+    /**
+     * Per-level collapse (OC-035, CEO 2026-09-20). One switch per level from 2 —
+     * level 1 is the roots and is always drawn. ON means "this level is shown";
+     * turning one OFF collapses every node on the level above it.
+     *
+     * The switches are a LADDER, and the gear's setter keeps them one: turning a
+     * level off turns every deeper level off with it, turning one on turns every
+     * shallower level on. A level cannot be visible while its parent level is
+     * folded away, so any other arrangement would be a lie on screen.
+     *
+     * They are an INSTRUCTION, not a running constraint: the visual applies them
+     * when the ladder CHANGES (against `levelsApplied`) and then leaves the
+     * collapse set alone, so a reader clicking one branch open is not overruled
+     * on the next render. The same contract `collapseToFitDone` already has.
+     *
+     * Eleven is the ceiling because an org eleven layers deep is already past
+     * what any chart reads; deeper levels follow level 11.
+     */
+    level2 = new formattingSettings.ToggleSwitch({ name: "level2", displayName: "Level 2", value: true });
+    level3 = new formattingSettings.ToggleSwitch({ name: "level3", displayName: "Level 3", value: true });
+    level4 = new formattingSettings.ToggleSwitch({ name: "level4", displayName: "Level 4", value: true });
+    level5 = new formattingSettings.ToggleSwitch({ name: "level5", displayName: "Level 5", value: true });
+    level6 = new formattingSettings.ToggleSwitch({ name: "level6", displayName: "Level 6", value: true });
+    level7 = new formattingSettings.ToggleSwitch({ name: "level7", displayName: "Level 7", value: true });
+    level8 = new formattingSettings.ToggleSwitch({ name: "level8", displayName: "Level 8", value: true });
+    level9 = new formattingSettings.ToggleSwitch({ name: "level9", displayName: "Level 9", value: true });
+    level10 = new formattingSettings.ToggleSwitch({ name: "level10", displayName: "Level 10", value: true });
+    level11 = new formattingSettings.ToggleSwitch({ name: "level11", displayName: "Level 11", value: true });
+
+    /** The ladder the visual has already acted on — machine state, not a control.
+     *  Without it a re-render would re-apply the levels and undo every branch the
+     *  reader had opened by hand. */
+    levelsApplied = new formattingSettings.TextInput({
+        name: "levelsApplied", displayName: "Levels applied", value: "", placeholder: "", visible: false,
     });
 
     /** Records that the auto-collapse has already run for this report, so it
@@ -101,9 +145,20 @@ class LayoutCard extends FormattingSettingsCard {
 
     name = "layout";
     displayName = "Layout";
+    /** Every level switch, shallowest first — the ladder, in order. */
+    levelSlices(): formattingSettings.ToggleSwitch[] {
+        return [
+            this.level2, this.level3, this.level4, this.level5, this.level6,
+            this.level7, this.level8, this.level9, this.level10, this.level11,
+        ];
+    }
+
     slices: FormattingSettingsSlice[] = [
         this.orientation, this.levelGap, this.siblingGap, this.leafStack, this.fillViewport,
-        this.collapseToFit, this.collapseToFitDone, this.collapsed,
+        this.collapseToFit,
+        this.level2, this.level3, this.level4, this.level5, this.level6,
+        this.level7, this.level8, this.level9, this.level10, this.level11,
+        this.levelsApplied, this.collapseToFitDone, this.collapsed,
     ];
 }
 
@@ -302,6 +357,24 @@ class OverlaysCard extends FormattingSettingsCard {
 }
 
 /**
+ * The minimap (OC-034) — the whole chart as a thumbnail, with the part on screen
+ * marked and draggable. Family name: the Gantt's `minimap.show`.
+ *
+ * Default ON. Since OC-030 a large hierarchy opens as a deliberate CROP, and a
+ * crop with no overview is the defect OC-QA-02 was; the thumbnail is how a
+ * reader sees how much more there is.
+ */
+class MinimapCard extends FormattingSettingsCard {
+    show = new formattingSettings.ToggleSwitch({
+        name: "show", displayName: "Minimap", value: true,
+        description: "A thumbnail of the whole chart in the bottom corner, with the visible part marked. Click or drag it to move the view.",
+    });
+    name = "minimap";
+    displayName = "Minimap";
+    slices: FormattingSettingsSlice[] = [this.show];
+}
+
+/**
  * The Table segment of the view switch, and where the switch sits (OC-029).
  * Object and property names are the FAMILY's (`summaryTable.show` /
  * `summaryTable.position`, as in the Network Graph and the Sankey) — keep them.
@@ -315,13 +388,13 @@ class SummaryTableCard extends FormattingSettingsCard {
         name: "position",
         displayName: "View switch position",
         items: [
-            { value: "auto", displayName: "Auto (top right)" },
+            { value: "auto", displayName: "Auto (bottom right)" },
             { value: "tl", displayName: "Top left" },
             { value: "tr", displayName: "Top right" },
             { value: "bl", displayName: "Bottom left" },
             { value: "br", displayName: "Bottom right" },
         ],
-        value: { value: "auto", displayName: "Auto (top right)" },
+        value: { value: "auto", displayName: "Auto (bottom right)" },
     });
     name = "summaryTable";
     displayName = "Summary table";
@@ -399,23 +472,59 @@ class OrgAnalysisCard extends FormattingSettingsCard {
  */
 class ToolbarCard extends FormattingSettingsCard {
     show = new formattingSettings.ToggleSwitch({ name: "show", displayName: "Show gear", value: true });
+    /**
+     * ⚠️ Auto resolves to BOTTOM-RIGHT since OC-034 (CEO, 2026-09-20), where it
+     * sits beside the view switch; OC-020 had put it top-right. The corner it
+     * vacated is the quick-action bar's. `auto` is a stored value, not a stored
+     * corner, so a report that never set this follows the new default — which is
+     * the intent: chrome placement is a look, not data.
+     */
     position = new formattingSettings.ItemDropdown({
         name: "position", displayName: "Gear position",
         items: [
-            { value: "auto", displayName: "Auto (top right)" },
+            { value: "auto", displayName: "Auto (bottom right)" },
             { value: "bl", displayName: "Bottom left" },
             { value: "tl", displayName: "Top left" },
             { value: "tr", displayName: "Top right" },
             { value: "br", displayName: "Bottom right" },
         ],
-        value: { value: "auto", displayName: "Auto (top right)" },
+        value: { value: "auto", displayName: "Auto (bottom right)" },
     });
     closeOnClickAway = new formattingSettings.ToggleSwitch({
         name: "closeOnClickAway", displayName: "Close on click-away", value: true,
     });
+
+    /**
+     * The quick-action bar — zoom in / zoom out / fit / lens (OC-034). It has
+     * always been drawn; what is new is that the author can move it, and turn it
+     * off. The family calls this pair `toolbar.actions` / `actionsPosition`
+     * (Gantt) — keep the names.
+     */
+    actions = new formattingSettings.ToggleSwitch({
+        name: "actions", displayName: "Quick actions (zoom, lens)", value: true,
+    });
+    actionsPosition = new formattingSettings.ItemDropdown({
+        name: "actionsPosition", displayName: "Quick actions position",
+        items: [
+            { value: "tr", displayName: "Top right" },
+            { value: "tl", displayName: "Top left" },
+            { value: "bl", displayName: "Bottom left" },
+            { value: "br", displayName: "Bottom right" },
+        ],
+        value: { value: "tr", displayName: "Top right" },
+    });
+    /** The magnifier button in that bar. Off leaves the original three. */
+    lens = new formattingSettings.ToggleSwitch({
+        name: "lens", displayName: "Lens", value: true,
+        description: "A magnifying loupe that follows the pointer, for reading cards drawn too small to see.",
+    });
+
     name = "toolbar";
     displayName = "Toolbar";
-    slices: FormattingSettingsSlice[] = [this.show, this.position, this.closeOnClickAway];
+    slices: FormattingSettingsSlice[] = [
+        this.show, this.position, this.closeOnClickAway,
+        this.actions, this.actionsPosition, this.lens,
+    ];
 }
 
 /**
@@ -438,6 +547,7 @@ export class VisualFormattingSettingsModel extends FormattingSettingsModel {
     connectors = new ConnectorsCard();
     labels = new LabelsCard();
     overlays = new OverlaysCard();
+    minimap = new MinimapCard();
     summaryTable = new SummaryTableCard();
     insights = new InsightsCard();
     rules = new RulesCard();
@@ -451,7 +561,7 @@ export class VisualFormattingSettingsModel extends FormattingSettingsModel {
     // Connectors · Labels · Overlays, then the domain and chrome cards.
     cards = [
         this.layout, this.nodes, this.colors, this.connectors, this.labels,
-        this.overlays, this.summaryTable, this.insights,
+        this.overlays, this.minimap, this.summaryTable, this.insights,
         this.rules, this.orgAnalysis, this.toolbar, this.branding,
     ];
 }

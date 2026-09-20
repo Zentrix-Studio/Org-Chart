@@ -18,7 +18,8 @@ type IVisualHost = powerbi.extensibility.visual.IVisualHost;
 import { VisualFormattingSettingsModel } from "../settings";
 import { ZentrixSettingsBar } from "./zentrixSettingsBar";
 import {
-    SB_CATS, SB_FONTS, SB_PALETTES, SB_PRESETS, SB_EMOJI,
+    SB_FONTS, SB_PALETTES, SB_PRESETS, SB_EMOJI,
+    makeCats, defaultShape, DataShape,
     makeCfg, applyLocal, readLocal, settingKeys, PersistWrite,
 } from "./settingsSchema";
 
@@ -59,6 +60,13 @@ export class SettingsOverlay {
     private presets: string[] = [...SB_PRESETS];
     /** Every gear key's value as of the last update — what the open panel shows. */
     private shown = new Map<string, string>();
+    /**
+     * What the bound data looks like, for the controls that depend on it — today
+     * the level ladder. Per INSTANCE, not a module constant: two Org Charts on
+     * one page can be looking at hierarchies of different depths, and a switch
+     * for a level the data does not have is a dead control.
+     */
+    private shape: DataShape = defaultShape();
 
     /**
      * @param onReset fired after a Reset, so the visual can drop the view state it
@@ -94,7 +102,7 @@ export class SettingsOverlay {
         }, () => this.reset());
 
         this.bar = new ZentrixSettingsBar(root, {
-            cfg, cats: SB_CATS, fonts: SB_FONTS, palettes: SB_PALETTES,
+            cfg, cats: makeCats(this.shape), fonts: SB_FONTS, palettes: SB_PALETTES,
             presets: this.presets, emoji: SB_EMOJI,
             corner: "bl", dark: false, closeOnAway: true,
         });
@@ -116,6 +124,24 @@ export class SettingsOverlay {
             else applyLocal(s, key, val);
         }
         this.settings = s;
+    }
+
+    /**
+     * Tell the gear how deep the bound hierarchy is, so the level ladder offers
+     * exactly the levels that exist. Called from the render, BEFORE `update`.
+     *
+     * A change re-draws an open panel: without that, binding a deeper field while
+     * Layout → Levels is open leaves the new levels missing until it is reopened.
+     */
+    setLevels(levels: number): void {
+        const next = Math.max(0, Math.round(levels));
+        if (next === this.shape.levels) return;
+        this.shape.levels = next;
+        if (!this.bar.isOpen()) return;
+        const bar = this.bar as unknown as { refreshActiveDetail?: () => void };
+        if (typeof bar.refreshActiveDetail === "function") {
+            try { bar.refreshActiveDetail(); } catch { /* a refresh must never break the render */ }
+        }
     }
 
     update(s: Model, dark: boolean, forceHidden = false): void {

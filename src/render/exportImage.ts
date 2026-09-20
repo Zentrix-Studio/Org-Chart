@@ -27,7 +27,11 @@ export function serializeSvg(svg: SVGSVGElement, size: ExportSize, background: s
     const clone = svg.cloneNode(true) as SVGSVGElement;
     // Interactive chrome is part of the app, not of the picture: an exported
     // PNG with zoom buttons stamped into the corner is a defect, not a feature.
-    const chrome = clone.querySelectorAll(".zoom-controls");
+    // The minimap and the lens joined the list in OC-034 — a loupe frozen into a
+    // PNG is the same defect, and the lens `<use>` would not resolve anyway once
+    // the chart group it re-uses is serialized out of its document.
+    const chrome = clone.querySelectorAll(
+        ".zoom-controls, .zx-minimap-layer, .zx-lens-layer");
     for (let i = 0; i < chrome.length; i++) {
         const el = chrome[i];
         if (el.parentNode) el.parentNode.removeChild(el);

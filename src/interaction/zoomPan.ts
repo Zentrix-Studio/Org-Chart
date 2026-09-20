@@ -174,14 +174,138 @@ export function createZoomPan(
     };
 }
 
-/** Vertical room the collapsed gear needs in the corner it shares. */
+/** Vertical room the collapsed gear (or the view pill) needs in a corner it shares. */
 export const GEAR_CLEARANCE = 54;
 
-export interface ZoomControlOptions {
+/** Button box, so the tests and the hit area agree on one number. */
+export const CONTROL_SIZE = 26;
+const CONTROL_GAP = 4;
+const CONTROL_MARGIN = 10;
+/**
+ * Room kept under a BOTTOM-corner stack for the status line / pan cue, which
+ * own the last rows of the canvas. A top-corner stack needs none of it.
+ */
+const STATUS_BAND = 14;
+
+/**
+ * The bar's OPTIONAL buttons, in the order they are given up when the canvas is
+ * too small to hold them all (OC-036).
+ *
+ * Zoom in, zoom out and fit are never shed — they are the way back in, and a
+ * chart with no way back in is what OC-007 was. "Show everything" goes first: a
+ * reader can still get there by holding `−`. The lens goes second: it is the
+ * only answer to a card too small to read, so it is worth more than a shortcut.
+ */
+export type OptionalButton = "fullView" | "lens";
+const SHED_ORDER: OptionalButton[] = ["fullView", "lens"];
+
+/** Which corner the quick-action bar sits in. Since OC-034 the default is top-right. */
+export type ActionCorner = "tl" | "tr" | "bl" | "br";
+
+/** A rectangle in viewport pixels — the same shape `treeLayout` fits around. */
+export interface ActionRect { x: number; y: number; w: number; h: number; }
+
+export interface ActionBarGeometry {
+    /** Viewport size. */
     width: number;
     height: number;
-    /** Extra room to leave at the bottom — the gear shares this corner. */
-    bottomInset?: number;
+    /** Corner to pin to. */
+    corner?: ActionCorner;
+    /** How many buttons the bar holds — 3 without the lens, 4 with it. */
+    buttons?: number;
+    /** Extra room to leave along the vertical edge: another piece shares this corner. */
+    cornerInset?: number;
+    /**
+     * Room to leave at the FAR end of the column, because something occupies the
+     * opposite corner on the same side (OC-036).
+     *
+     * On a tall canvas the bar and a bottom-corner gear never meet, so this is 0
+     * and nothing changes. On a short one they are effectively in the same strip:
+     * at 280×180 a five-button bar pinned top-right ran 28px into a gear pinned
+     * bottom-right. `cornerInset` only knows about the corner the bar is IN.
+     */
+    farInset?: number;
+}
+
+/**
+ * Where the quick-action bar lands, or `null` on a canvas too small to hold it.
+ *
+ * ONE piece of geometry, used by the renderer AND by `chromeObstacles` — before
+ * OC-034 the two carried the same constants separately and could disagree.
+ */
+export function actionBarRect(o: ActionBarGeometry): ActionRect | null {
+    const n = Math.max(1, o.buttons ?? 3);
+    const total = CONTROL_SIZE * n + CONTROL_GAP * (n - 1);
+    const inset = Math.max(0, o.cornerInset ?? 0);
+    const corner: ActionCorner = o.corner ?? "tr";
+    const bottom = corner.charAt(0) === "b";
+    const far = Math.max(CONTROL_MARGIN, Math.max(0, o.farInset ?? 0));
+    // No room for chrome on a tile — the buttons would cover the chart. The far
+    // end costs its own margin, or whatever the piece in the opposite corner
+    // needs, whichever is larger.
+    const needed = total + CONTROL_MARGIN + far + (bottom ? STATUS_BAND : 0) + inset;
+    if (o.width < 200 || o.height < needed) return null;
+    const x = corner.charAt(1) === "l"
+        ? CONTROL_MARGIN
+        : o.width - CONTROL_MARGIN - CONTROL_SIZE;
+    const y = bottom
+        ? o.height - CONTROL_MARGIN - total - STATUS_BAND - inset
+        : CONTROL_MARGIN + inset;
+    return { x, y, w: CONTROL_SIZE, h: total };
+}
+
+/**
+ * What the bar can show, and what it settles for.
+ *
+ * `planActionBar` is the ONE place that decides — the renderer and the visual's
+ * obstacle list both ask it, so the box that is drawn and the box the chart is
+ * fitted around can never disagree (the drift OC-034 removed).
+ */
+export interface ActionBarWants extends ActionBarGeometry {
+    /** The magnifier, when the author has it on. */
+    lens?: boolean;
+    /** "Show everything", when it would do something `fit` does not. */
+    fullView?: boolean;
+}
+
+export interface ActionBarPlan {
+    rect: ActionRect;
+    /** How many buttons fit, including the three that are never shed. */
+    buttons: number;
+    lens: boolean;
+    fullView: boolean;
+}
+
+/**
+ * Where the bar lands and what it can hold, or `null` when not even the three
+ * essential buttons fit — then the bar stands down, as every other piece of
+ * chrome does on a canvas too small for it.
+ */
+export function planActionBar(o: ActionBarWants): ActionBarPlan | null {
+    let lens = Boolean(o.lens);
+    let fullView = Boolean(o.fullView);
+    // Shed the optional buttons one at a time until the bar fits.
+    for (;;) {
+        const buttons = 3 + (lens ? 1 : 0) + (fullView ? 1 : 0);
+        const rect = actionBarRect({ ...o, buttons });
+        if (rect) return { rect, buttons, lens, fullView };
+        const next = SHED_ORDER.find((b) => (b === "lens" ? lens : fullView));
+        if (!next) return null;
+        if (next === "lens") lens = false; else fullView = false;
+    }
+}
+
+export interface LensButtonOptions {
+    /** Draw the lens button at all. */
+    show: boolean;
+    /** Its current state — pressed draws it on the accent. */
+    active: boolean;
+    label: string;
+    accent: string;
+    onToggle: () => void;
+}
+
+export interface ZoomControlOptions extends ActionBarGeometry {
     /** Button and glyph colours. */
     fg: string;
     bg: string;
@@ -191,31 +315,43 @@ export interface ZoomControlOptions {
     onZoomIn: () => void;
     onZoomOut: () => void;
     onFit: () => void;
+    /** The magnifier toggle (OC-034). Omit it and the bar is the original three. */
+    lens?: LensButtonOptions;
+    /**
+     * "Show everything" (OC-036) — the fit that ignores the legibility floor.
+     * Offered only when it would differ from `fit`, which since OC-030 stops AT
+     * the floor and therefore shows a crop of a large hierarchy.
+     */
+    fullView?: { show: boolean; label: string; onClick: () => void };
 }
 
-/** Button box, so the tests and the hit area agree on one number. */
-export const CONTROL_SIZE = 26;
-const CONTROL_GAP = 4;
-const CONTROL_MARGIN = 10;
-
 /**
- * Three buttons, bottom-right: zoom in, zoom out, fit.
+ * The quick-action bar: zoom in, zoom out, fit — and, since OC-034, the lens.
  *
- * Drawn as SVG primitives with `role="button"` and a tab stop each, because a
- * mouse-only zoom is not accessible and certification checks keyboard reach.
+ * Top-right by default (OC-034, CEO 2026-09-20); the author may pin it to any
+ * corner. Drawn as SVG primitives with `role="button"` and a tab stop each,
+ * because a mouse-only zoom is not accessible and certification checks keyboard
+ * reach.
+ *
+ * ⚠️ The lens button is appended LAST so `.zoom-button[0..2]` stay in / out / fit
+ * — the gates and a dozen tests address them by index.
  */
 export function renderZoomControls(root: GSel, o: ZoomControlOptions): void {
     root.selectAll("g.zoom-controls").remove();
-    // No room for chrome on a tile — the buttons would cover the chart.
-    if (o.width < 200 || o.height < 140 + (o.bottomInset ?? 0)) return;
+    const plan = planActionBar({
+        ...o,
+        lens: Boolean(o.lens && o.lens.show),
+        fullView: Boolean(o.fullView && o.fullView.show),
+    });
+    if (!plan) return;
 
     const g = root.append("g").attr("class", "zoom-controls");
-    const x = o.width - CONTROL_MARGIN - CONTROL_SIZE;
-    const total = CONTROL_SIZE * 3 + CONTROL_GAP * 2;
-    const y0 = o.height - CONTROL_MARGIN - total - 14 - (o.bottomInset ?? 0);
+    const x = plan.rect.x;
+    const y0 = plan.rect.y;
 
     const button = (
         index: number, label: string, glyph: (b: GSel) => void, action: () => void,
+        opts: { pressed?: boolean; fill?: string; ink?: string } = {},
     ): void => {
         const b = g.append("g")
             .attr("class", "zoom-button")
@@ -223,10 +359,11 @@ export function renderZoomControls(root: GSel, o: ZoomControlOptions): void {
             .attr("role", "button")
             .attr("tabindex", 0)
             .attr("aria-label", label) as GSel;
+        if (opts.pressed !== undefined) b.attr("aria-pressed", opts.pressed ? "true" : "false");
         b.append("title").text(label);
         b.append("rect")
             .attr("width", CONTROL_SIZE).attr("height", CONTROL_SIZE).attr("rx", 6)
-            .attr("fill", o.bg).attr("stroke", o.stroke).attr("stroke-width", 1);
+            .attr("fill", opts.fill ?? o.bg).attr("stroke", o.stroke).attr("stroke-width", 1);
         glyph(b);
         b.on("click", (event: MouseEvent) => {
             event.stopPropagation();      // never clear the cross-filter selection
@@ -242,9 +379,9 @@ export function renderZoomControls(root: GSel, o: ZoomControlOptions): void {
     };
 
     const c = CONTROL_SIZE / 2;
-    const stroke = (b: GSel, d: string): void => {
+    const stroke = (b: GSel, d: string, ink?: string): void => {
         b.append("path").attr("d", d)
-            .attr("fill", "none").attr("stroke", o.fg).attr("stroke-width", 1.6)
+            .attr("fill", "none").attr("stroke", ink ?? o.fg).attr("stroke-width", 1.6)
             .attr("stroke-linecap", "round");
     };
 
@@ -255,4 +392,37 @@ export function renderZoomControls(root: GSel, o: ZoomControlOptions): void {
         stroke(b, `M${c - 5},${c - 2} v-3 h3 M${c + 5},${c - 2} v-3 h-3`
             + ` M${c - 5},${c + 2} v3 h3 M${c + 5},${c + 2} v3 h-3`);
     }, o.onFit);
+
+    let slot = 3;
+    /*
+     * "Show everything" — the whole chart at whatever scale that takes, below the
+     * legibility floor if it must. `fit` deliberately stops AT the floor
+     * (OC-030), so on a large hierarchy the two are different answers and both
+     * are wanted: one readable, one complete. The glyph is a frame around
+     * something small, not a second pair of corner brackets.
+     */
+    if (o.fullView && plan.fullView) {
+        const full = o.fullView;
+        button(slot++, full.label, (b) => {
+            b.append("rect")
+                .attr("x", c - 7.5).attr("y", c - 6).attr("width", 15).attr("height", 12).attr("rx", 1.5)
+                .attr("fill", "none").attr("stroke", o.fg).attr("stroke-width", 1.4);
+            b.append("rect")
+                .attr("x", c - 2.5).attr("y", c - 2).attr("width", 5).attr("height", 4)
+                .attr("fill", o.fg);
+        }, full.onClick);
+    }
+
+    if (o.lens && plan.lens) {
+        const lens = o.lens;
+        // A magnifying glass: the ring, the handle, and a "+" inside it so the
+        // button reads as "make this bigger" rather than "search" — the search
+        // box is a different control and sits in the same visual.
+        const ink = lens.active ? "#FFFFFF" : o.fg;
+        button(slot++, lens.label, (b) => {
+            stroke(b, `M${c - 1.5},${c - 1.5} m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0`, ink);
+            stroke(b, `M${c + 1.6},${c + 1.6} L${c + 5},${c + 5}`, ink);
+            stroke(b, `M${c - 3.6},${c - 1.5} h4.2 M${c - 1.5},${c - 3.6} v4.2`, ink);
+        }, lens.onToggle, { pressed: lens.active, fill: lens.active ? lens.accent : o.bg });
+    }
 }

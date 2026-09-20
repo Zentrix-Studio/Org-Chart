@@ -16,7 +16,7 @@
 
 import type powerbi from "powerbi-visuals-api";
 import { VisualFormattingSettingsModel } from "../settings";
-import type { SBCategory, SBCfg, SBFont, SBOption, SBPalette } from "./zentrixSettingsBar";
+import type { SBCategory, SBCfg, SBField, SBFont, SBOption, SBPalette } from "./zentrixSettingsBar";
 import { COLOR_PICKER_PRESETS } from "./colorPickerPresets";
 import { categoryPalette, accent, accentStrong, fontFamily } from "../theme/zentrixTokens";
 
@@ -115,6 +115,65 @@ function color(object: string, prop: string, acc: (m: Model) => AnySlice): Entry
 }
 
 /**
+ * The per-level collapse ladder (OC-035). Level 1 is the roots and is always
+ * drawn, so the switches run from 2.
+ */
+export const FIRST_LEVEL = 2;
+export const LAST_LEVEL = 11;
+export const LEVEL_KEYS: string[] = [];
+for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) LEVEL_KEYS.push(`layout.level${n}`);
+
+/** The ladder's state as a string, for comparing one render against the next. */
+export function levelLadder(m: Model): string {
+    return LEVEL_KEYS.map((k) => (readLocal(m, k) ? "1" : "0")).join("");
+}
+
+/**
+ * How many levels the ladder says to show: 1 (the roots alone) plus every level
+ * switched on before the first one switched off. The switches are kept monotone
+ * by `levelBool`, so this is the whole reading of them.
+ */
+export function levelsShown(ladder: string): number {
+    let n = 1;
+    for (const c of ladder) {
+        if (c !== "1") break;
+        n++;
+    }
+    return n;
+}
+
+/**
+ * One level switch — and its LADDER, written in the same batch.
+ *
+ * A level cannot be on screen while the level above it is folded away, so the
+ * switches move together: turning level 5 off turns 6…11 off, turning level 5 on
+ * turns 2…4 on. Every write goes through the one `p` the caller collects, so the
+ * whole ladder lands as a SINGLE `persistProperties` merge — several synchronous
+ * calls are coalesced by the host and all but the last are dropped, which is the
+ * defect `PersistBatch` exists for.
+ */
+function levelBool(n: number): Entry {
+    const nameOf = (i: number): string => `level${i}`;
+    const sliceOf = (m: Model, i: number): AnySlice =>
+        (m.layout as unknown as Record<string, AnySlice>)[nameOf(i)];
+    return {
+        get: (m) => sliceOf(m, n).value,
+        set: (p, v) => {
+            const on = Boolean(v);
+            p("layout", nameOf(n), on);
+            if (on) for (let i = FIRST_LEVEL; i < n; i++) p("layout", nameOf(i), true);
+            else for (let i = n + 1; i <= LAST_LEVEL; i++) p("layout", nameOf(i), false);
+        },
+        setLocal: (m, v) => {
+            const on = Boolean(v);
+            sliceOf(m, n).value = on;
+            if (on) for (let i = FIRST_LEVEL; i < n; i++) sliceOf(m, i).value = true;
+            else for (let i = n + 1; i <= LAST_LEVEL; i++) sliceOf(m, i).value = false;
+        },
+    };
+}
+
+/**
  * Every control the gear can reach, keyed as `object.property`.
  *
  * Keys here are the SAME strings the format pane persists — they are the
@@ -129,6 +188,17 @@ const KEYS: Record<string, Entry> = {
     "layout.leafStack": dropdown("layout", "leafStack", (m) => m.layout.leafStack),
     "layout.fillViewport": bool("layout", "fillViewport", (m) => m.layout.fillViewport),
     "layout.collapseToFit": bool("layout", "collapseToFit", (m) => m.layout.collapseToFit),
+    // The per-level ladder (OC-035). Each one cascades — see `levelBool`.
+    "layout.level2": levelBool(2),
+    "layout.level3": levelBool(3),
+    "layout.level4": levelBool(4),
+    "layout.level5": levelBool(5),
+    "layout.level6": levelBool(6),
+    "layout.level7": levelBool(7),
+    "layout.level8": levelBool(8),
+    "layout.level9": levelBool(9),
+    "layout.level10": levelBool(10),
+    "layout.level11": levelBool(11),
 
     // Nodes
     "nodes.sizeMode": dropdown("nodes", "sizeMode", (m) => m.nodes.sizeMode),
@@ -164,6 +234,7 @@ const KEYS: Record<string, Entry> = {
     "overlays.tooltipStyle": dropdown("overlays", "tooltipStyle", (m) => m.overlays.tooltipStyle),
     "overlays.showLegend": bool("overlays", "showLegend", (m) => m.overlays.showLegend),
     "overlays.showSearch": bool("overlays", "showSearch", (m) => m.overlays.showSearch),
+    "minimap.show": bool("minimap", "show", (m) => m.minimap.show),
     // View switch (OC-029) — the family's object names, unchanged.
     "summaryTable.show": bool("summaryTable", "show", (m) => m.summaryTable.show),
     "summaryTable.position": dropdown("summaryTable", "position", (m) => m.summaryTable.position),
@@ -183,6 +254,10 @@ const KEYS: Record<string, Entry> = {
     "toolbar.show": bool("toolbar", "show", (m) => m.toolbar.show),
     "toolbar.position": dropdown("toolbar", "position", (m) => m.toolbar.position),
     "toolbar.closeOnClickAway": bool("toolbar", "closeOnClickAway", (m) => m.toolbar.closeOnClickAway),
+    // The quick-action bar and the lens (OC-034).
+    "toolbar.actions": bool("toolbar", "actions", (m) => m.toolbar.actions),
+    "toolbar.actionsPosition": dropdown("toolbar", "actionsPosition", (m) => m.toolbar.actionsPosition),
+    "toolbar.lens": bool("toolbar", "lens", (m) => m.toolbar.lens),
     "branding.showBranding": bool("branding", "showBranding", (m) => m.branding.showBranding),
 };
 
@@ -245,7 +320,48 @@ export function makeCfg(
 
 const opt = (value: string, label: string): SBOption => [value, label];
 
-export const SB_CATS: SBCategory[] = [
+/**
+ * What the BOUND DATA looks like, for the controls whose usefulness depends on
+ * it. Today that is only the level ladder: a switch for a level the hierarchy
+ * does not have is the dead control this product is positioned against.
+ *
+ * It is per-instance and mutable rather than a setting, because it describes the
+ * data, not the author's choice — the visual refreshes it on every render
+ * (`SettingsOverlay.setLevels`). Two Org Charts on one page each get their own.
+ */
+export interface DataShape {
+    /** How many levels deep the bound hierarchy is. */
+    levels: number;
+}
+
+/** The shape assumed before any data arrives — show the whole ladder. */
+export function defaultShape(): DataShape { return { levels: LAST_LEVEL }; }
+
+/** The ten level switches, each shown only when the hierarchy is that deep. */
+function levelFields(shape: DataShape): SBField[] {
+    const out: SBField[] = [
+        {
+            control: "note",
+            label: "This hierarchy is a single level — there is nothing below the roots to fold away.",
+            visibleIf: () => shape.levels < FIRST_LEVEL,
+        },
+    ];
+    for (let n = FIRST_LEVEL; n <= LAST_LEVEL; n++) {
+        out.push({
+            control: "switch",
+            label: `Level ${n}`,
+            key: `layout.level${n}`,
+            visibleIf: () => shape.levels >= n,
+            noteFn: (g) => (g(`layout.level${n}`)
+                ? undefined
+                : `Level ${n} and everything below it is folded into a count on level ${n - 1}.`),
+        });
+    }
+    return out;
+}
+
+export function makeCats(shape: DataShape): SBCategory[] {
+    return [
     // 1 — Layout. The shape of the tree itself.
     {
         id: "layout", name: "Layout", subs: [
@@ -289,9 +405,14 @@ export const SB_CATS: SBCategory[] = [
                     { control: "divider" },
                     {
                         control: "switch", label: "Collapse deep levels to fit", key: "layout.collapseToFit",
-                        note: "Open a large hierarchy at the top, with the deeper levels folded behind a + . Runs once per report; turning it off never expands what is already collapsed.",
+                        note: "Open a large hierarchy at the top, with the deeper levels folded behind a + , at a size the names can be read at. Turning it off shows every level again; turning it on folds to fit. It never re-folds a branch a reader has opened by hand.",
                     },
                 ],
+            },
+            {
+                id: "levels", name: "Levels", kind: "fields", width: 280,
+                info: "Which levels of the hierarchy are drawn. Level 1 is the roots and is always shown. Turning a level off folds the level above it into a count — which is how a large org stays readable.",
+                fields: levelFields(shape),
             },
         ],
     },
@@ -464,7 +585,7 @@ export const SB_CATS: SBCategory[] = [
                     },
                     {
                         control: "select", label: "Position", key: "summaryTable.position",
-                        options: [opt("auto", "Auto (top right)"), opt("tl", "Top left"),
+                        options: [opt("auto", "Auto (bottom right)"), opt("tl", "Top left"),
                             opt("tr", "Top right"), opt("bl", "Bottom left"), opt("br", "Bottom right")],
                         dimIf: (g) => !g("summaryTable.show") && !g("insights.show"),
                         disabledReason: "Turn on Summary table or Insights to show the view switch.",
@@ -476,7 +597,35 @@ export const SB_CATS: SBCategory[] = [
                 info: "What the visual draws on top of the chart.",
                 fields: [
                     { control: "switch", label: "Legend", key: "overlays.showLegend" },
-                    { control: "switch", label: "Search box", key: "overlays.showSearch" },
+                    {
+                        control: "switch", label: "Search box", key: "overlays.showSearch",
+                        note: "The Search people field in the top corner — type a name and the chart jumps to that card.",
+                    },
+                    {
+                        control: "switch", label: "Minimap", key: "minimap.show",
+                        note: "A thumbnail of the whole chart, with the part on screen marked. Click or drag it to move the view.",
+                    },
+                ],
+            },
+            {
+                id: "actions", name: "Quick actions", kind: "fields", width: 268,
+                info: "The zoom / fit / lens buttons anyone reading the report can use.",
+                fields: [
+                    { control: "switch", label: "Quick actions", key: "toolbar.actions" },
+                    {
+                        control: "select", label: "Position", key: "toolbar.actionsPosition",
+                        options: [opt("tr", "Top right"), opt("tl", "Top left"),
+                            opt("bl", "Bottom left"), opt("br", "Bottom right")],
+                        dimIf: (g) => !g("toolbar.actions"),
+                        disabledReason: "Turn on Quick actions to place them.",
+                    },
+                    { control: "divider" },
+                    {
+                        control: "switch", label: "Lens", key: "toolbar.lens",
+                        note: "A magnifying loupe that follows the pointer — for reading cards drawn too small to see.",
+                        dimIf: (g) => !g("toolbar.actions"),
+                        disabledReason: "The lens lives in the quick-action bar.",
+                    },
                 ],
             },
             {
@@ -486,7 +635,7 @@ export const SB_CATS: SBCategory[] = [
                     { control: "switch", label: "Show gear", key: "toolbar.show" },
                     {
                         control: "select", label: "Position", key: "toolbar.position",
-                        options: [opt("auto", "Auto (top right)"), opt("bl", "Bottom left"),
+                        options: [opt("auto", "Auto (bottom right)"), opt("bl", "Bottom left"),
                             opt("tl", "Top left"), opt("tr", "Top right"), opt("br", "Bottom right")],
                     },
                     { control: "switch", label: "Close on click-away", key: "toolbar.closeOnClickAway" },
@@ -543,4 +692,12 @@ export const SB_CATS: SBCategory[] = [
             },
         ],
     },
-];
+    ];
+}
+
+/**
+ * The schema as the tests, the gates and any caller without an instance see it:
+ * every level switch shown. A live gear builds its own through `makeCats` so the
+ * ladder can follow the data it is actually looking at.
+ */
+export const SB_CATS: SBCategory[] = makeCats(defaultShape());
