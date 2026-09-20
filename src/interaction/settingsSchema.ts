@@ -642,7 +642,7 @@ export function makeCats(shape: DataShape): SBCategory[] {
                     { control: "divider" },
                     {
                         control: "switch", label: "Zentrix branding", key: "branding.showBranding",
-                        note: "A small Zentrix wordmark on the tooltip card.",
+                        note: "A small Zentrix wordmark on the tooltip card, while you are editing the report. Microsoft's guidelines do not allow a company mark in view mode, so readers never see it.",
                     },
                 ],
             },

@@ -530,6 +530,13 @@ class ToolbarCard extends FormattingSettingsCard {
 /**
  * Zentrix branding — a subtle wordmark on the tooltip card. Default on, and any
  * user can turn it off here: it has never been gated and never will be.
+ *
+ * ⚠️ On does NOT mean everywhere (OC-043). Microsoft's publishing guidelines
+ * allow a company mark in EDIT mode only — "Commercial logos can't be displayed
+ * in view mode" — and a text-only logotype is one of the three kinds they name.
+ * So the wordmark is drawn for an author and never for a report reader; this
+ * switch says whether it is wanted at all, `Visual.editing` says where it is
+ * allowed. Do not "fix" the reader case back on.
  */
 class BrandingCard extends FormattingSettingsCard {
     showBranding = new formattingSettings.ToggleSwitch({

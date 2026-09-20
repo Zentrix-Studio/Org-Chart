@@ -35,7 +35,7 @@ import { renderLegend, LegendItem, LEGEND_HEIGHT } from "./render/legend";
 import { createSearchBox, SearchHandle } from "./interaction/search";
 import {
     createZoomPan, renderZoomControls, ZoomPanHandle, ZOOM_STEP, MAX_AUTO_SCALE,
-    GEAR_CLEARANCE, planActionBar, ActionCorner,
+    GEAR_CLEARANCE, planActionBar, ActionCorner, MIN_SCALE, MAX_SCALE,
 } from "./interaction/zoomPan";
 import { renderLens, clearLens } from "./render/lens";
 import {
@@ -125,6 +125,32 @@ function overChrome(target: EventTarget | null): boolean {
     return false;
 }
 
+/** A saved view: the scale, and the chart-space point that was in the middle. */
+interface SavedView { k: number; cx: number; cy: number }
+
+/** How long the view must sit still before it is written to the report. */
+const VIEW_SAVE_MS = 600;
+
+/** Three decimals is a tenth of a pixel at any scale we draw — and a short blob. */
+function round3(v: number): number { return Math.round(v * 1000) / 1000; }
+
+/**
+ * Read a saved view. Anything malformed is no view at all: this blob travels in
+ * the report file, so it can arrive from an older build, a hand edit or a
+ * half-written bookmark, and the answer to all three is the automatic fit.
+ */
+function parseView(blob: string): SavedView | null {
+    if (!blob) return null;
+    try {
+        const v = JSON.parse(blob) as Partial<SavedView>;
+        if (typeof v.k !== "number" || typeof v.cx !== "number" || typeof v.cy !== "number") return null;
+        if (!isFinite(v.k) || !isFinite(v.cx) || !isFinite(v.cy)) return null;
+        return { k: Math.min(MAX_SCALE, Math.max(MIN_SCALE, v.k)), cx: v.cx, cy: v.cy };
+    } catch {
+        return null;
+    }
+}
+
 export class Visual implements IVisual {
     /** Clip ids are unique per DOCUMENT: two Org Charts on one page share one. */
     private static clipSeq = 0;
@@ -140,6 +166,22 @@ export class Visual implements IVisual {
     private allowInteractions = true;
     /** Rendering for an export / dashboard host: no chrome, fitted (#5). */
     private exporting = false;
+    /**
+     * Is an AUTHOR editing the report right now? (OC-043)
+     *
+     * The only thing this gates is the Zentrix wordmark on the hover card.
+     * Microsoft's publishing guidelines: *"Commercial logos are allowed in edit
+     * mode only. Commercial logos can't be displayed in view mode."* — and a
+     * **logotype**, text with no icon, is one of the three kinds they name. The
+     * wordmark used to draw for report READERS too, which is the one place the
+     * rule forbids.
+     *
+     * ⚠️ `options.viewMode`, never `editMode` — the other one has caused an S1
+     * in this portfolio twice. `ViewMode.View` is 0, `Edit` 1, `InFocusEdit` 2.
+     * A host that sends nothing is treated as VIEW: failing closed costs a brand
+     * impression, failing open costs a certification cycle.
+     */
+    private editing = false;
     /** Photo data URI → decoded ("ok"), not an image ("bad"), or still probing (#10). */
     private photoStatus = new Map<string, "ok" | "bad" | "pending">();
     /** An update whose renderingFinished waits for photos still decoding. */
@@ -150,12 +192,19 @@ export class Visual implements IVisual {
     private probing = false;
     /** Set by destroy(): late photo answers must not draw or raise rendering events. */
     private destroyed = false;
+    /** True between beforeprint and afterprint: the print fit is not a view choice. */
+    private printing = false;
     private readonly onBeforePrint = (): void => {
         if (this.root) this.root.classList.add("zx-printing");
+        // Printing fits the chart to the page, which is a refit like any other —
+        // but it is the printer's decision, not the author's, so it must not
+        // erase the view saved in the report (OC-042).
+        this.printing = true;
         this.refit();
     };
     private readonly onAfterPrint = (): void => {
         if (this.root) this.root.classList.remove("zx-printing");
+        this.printing = false;
     };
     private palette: ResolvedPalette | null = null;
     /** Node index that currently has keyboard focus. */
@@ -187,6 +236,26 @@ export class Visual implements IVisual {
     private autoFitApplied = false;
     /** What the view was last fitted to; a change re-fits, a user gesture does not. */
     private viewSignature = "";
+    /**
+     * The saved view (`viewState.data`), so a reopened report comes back to the
+     * place its author left rather than to the automatic fit (OC-042).
+     * `pendingView` is a write not yet echoed; it wins over what the host says,
+     * exactly as `colorStore` does.
+     */
+    private lastViewBlob = "";
+    private pendingView: string | null = null;
+    private storedView: SavedView | null = null;
+    /** A stored view is applied ONCE — after that the reader owns the transform. */
+    private viewRestored = false;
+    /** Debounce: a gesture is dozens of transforms, and each one is a host write. */
+    private viewSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /**
+     * The part of the picture a MOVED view is not allowed to survive (OC-042):
+     * the data itself and the author's layout controls. Everything else — a
+     * collapse, a resize, chrome appearing — keeps the reader where they are.
+     */
+    private layoutSignature = "";
     /** Bounds + viewport of the last render, so "fit" works without re-laying out. */
     /** Card rectangles of the last layout, in layout units — what the fit keeps clear of chrome. */
     private lastCards: ScreenRect[] = [];
@@ -341,6 +410,8 @@ export class Visual implements IVisual {
         // click-away listener on `document` never sees it — the visual has to say so.
         this.zoom = createZoomPan(this.svg, this.viewport, () => {
             this.updatePanHint();
+            // Save where the reader is, once they stop moving.
+            this.scheduleViewSave();
             // The window rectangle answers to the LIVE view, not to the last data
             // render — the same reason the pan cue is its own element.
             this.updateMinimap();
@@ -496,6 +567,8 @@ export class Visual implements IVisual {
             this.events.renderingFinished(prev);
         }
         this.lastOptions = options;
+        this.editing = options.viewMode === powerbi.ViewMode.Edit
+            || options.viewMode === powerbi.ViewMode.InFocusEdit;
         if (!this.redrawing) this.events.renderingStarted(options);
         try {
             const dataView: DataView | undefined = options.dataViews && options.dataViews[0];
@@ -552,6 +625,7 @@ export class Visual implements IVisual {
             this.maybeFetchMore(dataView);
             if (this.settings.nodes.showPhoto.value) this.probePhotos(model);
             this.syncGroupSlots(model, dataView, palette);
+            this.syncViewState(dataView);
             if (model.nodes.length === 0) {
                 this.leaveAltViews();
                 this.renderLanding(EmptyReason.NoData, dataView, w, h, palette);
@@ -794,10 +868,56 @@ export class Visual implements IVisual {
                 this.settings.toolbar.actions.value, this.settings.toolbar.actionsPosition.value.value,
                 this.settings.toolbar.lens.value,
             ].join("|");
-            if (signature !== this.viewSignature || !this.zoom || !this.zoom.touched()) {
-                this.viewSignature = signature;
+            /*
+             * The subset that outranks a reader's own gesture. Data first: a
+             * slicer that cuts the org to three people leaves an old transform
+             * describing nothing. Then the author's layout controls, where a
+             * change is a deliberate edit to the picture and refitting is the
+             * answer they expect. Collapse, viewport size and chrome are
+             * deliberately NOT here.
+             */
+            const layoutSignature = [
+                model.nodes.length,
+                this.settings.layout.orientation.value.value,
+                this.settings.nodes.cardWidth.value, this.settings.nodes.cardHeight.value,
+                this.settings.layout.levelGap.value, this.settings.layout.siblingGap.value,
+                this.settings.layout.fillViewport.value,
+                this.settings.nodes.sizeMode.value.value,
+                this.settings.labels.nameSize.value, this.settings.labels.titleSize.value,
+            ].join("|");
+            /*
+             * Who owns the view right now?
+             *
+             * Nobody has moved it → the fit does, on every render.
+             * The reader has moved it → they keep it (OC-042, CEO "zoom is not
+             * persisting"). Folding a branch, resizing the visual or turning a
+             * piece of chrome on used to snap them back to the fit, because all
+             * three are in `signature` — so a zoom survived a refresh and a
+             * cross-filter but never the one gesture people actually make next.
+             * `keepView` holds the transform and only rescues a view the new
+             * layout left off screen.
+             *
+             * A refit still wins over a moved view when the PICTURE itself is
+             * different — new data, a flipped orientation, a resized card. There
+             * the old transform describes a chart that no longer exists.
+             */
+            const untouched = !this.zoom || !this.zoom.touched();
+            /*
+             * A stored view the host has handed us and we have not applied yet —
+             * a reopened report, or a BOOKMARK. It wins even over a reader who
+             * has already moved: restoring a bookmark that leaves the view where
+             * the reader happened to be is not restoring anything. Our own
+             * writes mark themselves applied, so this never fights a gesture.
+             */
+            if (this.storedView && !this.viewRestored) {
+                this.applyStoredView();
+            } else if (untouched || layoutSignature !== this.layoutSignature) {
                 this.refit();
+            } else if (signature !== this.viewSignature) {
+                this.keepView();
             }
+            this.viewSignature = signature;
+            this.layoutSignature = layoutSignature;
 
             const { colorOf, dashOf } = this.cardColors(model, hierarchy, palette);
 
@@ -919,7 +1039,7 @@ export class Visual implements IVisual {
                 width: this.settings.connectors.width.value,
             });
 
-            this.bindInteraction(keys, model, hierarchy, hidden, metrics, palette);
+            this.bindInteraction(keys, model, hierarchy, hidden, metrics, palette, ruleColorOf);
             this.renderStatus(model, hierarchy, w, h, surface.muted, summary, changeOf);
 
             // Legend — drawn after the status line, which clears `chrome`, and
@@ -1020,6 +1140,8 @@ export class Visual implements IVisual {
         hidden: ReadonlySet<number>,
         metrics: NodeMetrics[] | null,
         palette: ResolvedPalette,
+        /** The colour each card is actually painted — the tooltip shows the same one. */
+        colorOf: (i: number) => string,
     ): void {
         const self = this;
         const cards = this.viewport.selectAll<SVGGElement, number>("g.card");
@@ -1051,7 +1173,16 @@ export class Visual implements IVisual {
                 displayName: c.displayName,
                 value: String(c.values[model.nodes[i].index] ?? ""),
             })),
-            color: palette.groupColor(0),
+            /*
+             * The swatch is the card's OWN colour (OC-042 — CEO: "tooltip color
+             * not changing"). It was `groupColor(0)` for every person, so the
+             * dot beside the header was the first palette entry whoever you
+             * hovered: it never followed the colour mode, the accent picker, the
+             * report theme or a conditional-format rule. `colorOf` is the
+             * function the renderer paints with, rules included, so the two
+             * cannot drift.
+             */
+            color: colorOf(i),
         });
 
         const style = this.settings.overlays.tooltipStyle.value.value as TooltipStyle;
@@ -1082,7 +1213,9 @@ export class Visual implements IVisual {
                 accent: palette.highContrast ? palette.surface.fg : accent,
                 pos: posSafe, neg: negSafe, fontFamily,
             });
-            tip.setBranding(this.settings.branding.showBranding.value);
+            // Edit mode only — see `editing`. The setting still owns whether it
+            // is wanted at all; this owns where it is allowed.
+            tip.setBranding(this.settings.branding.showBranding.value && this.editing);
             cards
                 .on("mousemove.tip", (event: MouseEvent, i: number) => {
                     // The gear owns the pointer while it is open.
@@ -2310,6 +2443,12 @@ export class Visual implements IVisual {
         this.lastHostLadder = null;
         this.prevLadder = null;
         this.viewSignature = "";
+        this.layoutSignature = "";
+        // The saved view goes with the rest of the formatting Reset clears.
+        this.storedView = null;
+        this.pendingView = null;
+        this.lastViewBlob = "";
+        this.viewRestored = false;
         if (this.zoom) this.zoom.clearTouched();
     }
 
@@ -2422,6 +2561,130 @@ export class Visual implements IVisual {
         );
         this.zoom.apply({ k: t.k, tx: t.tx, ty: t.ty });
         this.zoom.clearTouched();
+    }
+
+    /**
+     * Read the saved view off the report (OC-042).
+     *
+     * Same three-step dance as `colorStore`: a write this instance has made and
+     * the host has not echoed yet WINS, so an in-flight save is never clobbered
+     * by a stale round-trip. A blob that differs from the last one seen is a new
+     * view — a reopen, a bookmark, another author's save — and is applied once.
+     */
+    private syncViewState(dataView: DataView | undefined): void {
+        const obj = (dataView?.metadata?.objects as { viewState?: { data?: unknown } } | undefined)?.viewState;
+        const stored = typeof obj?.data === "string" ? obj.data : "";
+        if (this.pendingView !== null && stored === this.pendingView) this.pendingView = null;
+        if (this.pendingView !== null || stored === this.lastViewBlob) return;
+        this.lastViewBlob = stored;
+        this.storedView = parseView(stored);
+        this.viewRestored = false;
+    }
+
+    /**
+     * Put the reader back where the report was saved.
+     *
+     * The blob holds the SCALE and the chart-space point that was centred, never
+     * a raw transform: the visual can reopen at a different size — a phone, a
+     * dashboard tile, focus mode — and a translation copied verbatim would land
+     * somewhere else entirely. Marked as touched, because it is the author's
+     * view and not the fit's: the automatic fit must not take it back on the
+     * next update. `keepView` then does the clamping, so a saved view whose
+     * chart has since been filtered away still finds the chart.
+     */
+    private applyStoredView(): void {
+        if (!this.storedView || !this.lastFit || !this.zoom) return;
+        this.viewRestored = true;
+        const { k, cx, cy } = this.storedView;
+        this.zoom.apply({
+            k,
+            tx: this.lastFit.width / 2 - cx * k,
+            ty: this.lastFit.height / 2 - cy * k,
+        });
+        this.zoom.markTouched();
+        this.keepView();
+    }
+
+    /**
+     * Save the view after it settles.
+     *
+     * A single wheel gesture is dozens of transforms and each write is a host
+     * round-trip that also marks the report dirty, so nothing is written until
+     * the movement stops. The delay is doing a second job: `refit()` clears the
+     * touched flag AFTER it applies the transform, so by the time this runs the
+     * flag reads false and the save is correctly an erase — pressing ⛶ puts the
+     * report back to opening on the automatic fit.
+     */
+    private scheduleViewSave(): void {
+        if (this.viewSaveTimer !== null) clearTimeout(this.viewSaveTimer);
+        this.viewSaveTimer = setTimeout(() => {
+            this.viewSaveTimer = null;
+            this.persistView();
+        }, VIEW_SAVE_MS);
+    }
+
+    private persistView(): void {
+        if (!this.zoom || !this.lastFit || this.destroyed || this.printing) return;
+        const t = this.zoom.current();
+        const blob = this.zoom.touched() && t.k > 0
+            ? JSON.stringify({
+                k: round3(t.k),
+                cx: round3((this.lastFit.width / 2 - t.tx) / t.k),
+                cy: round3((this.lastFit.height / 2 - t.ty) / t.k),
+            })
+            : "";
+        if (blob === this.lastViewBlob) return;
+        this.lastViewBlob = blob;
+        this.pendingView = blob;
+        this.storedView = parseView(blob);
+        // Already on screen — a restore of what is being looked at would be a jump.
+        this.viewRestored = true;
+        this.host.persistProperties({
+            merge: [{ objectName: "viewState", selector: null, properties: { data: blob } }],
+        } as powerbi.VisualObjectInstancesToPersist);
+    }
+
+    /**
+     * Hold a view the reader moved, through a change that re-laid out the chart
+     * (OC-042 — CEO: "zoom is not persisting").
+     *
+     * The transform is kept exactly as it is, so folding a branch or resizing
+     * the visual leaves the same place on screen at the same scale. The only
+     * thing this does is rescue a view the new layout has left with nothing in
+     * it: the tree can shrink or move under a stationary viewport — fold the
+     * branch you were reading and it is gone — and a reader staring at empty
+     * canvas has no way of knowing which direction to drag.
+     *
+     * The rescue is deliberately loose. It asks only that `KEEP` pixels of the
+     * chart still meet the viewport on each axis, and then moves by the
+     * smallest amount that buys that. A view already showing a piece of the
+     * chart is never touched, however far off-centre the reader put it — being
+     * "tidied" mid-read is the thing this whole change exists to stop.
+     */
+    private keepView(): void {
+        if (!this.lastFit || !this.zoom) return;
+        const t = this.zoom.current();
+        const b = this.lastFit.bounds;
+        /** How much of the chart must stay in the box before it counts as lost. */
+        const KEEP = 48;
+        /**
+         * @param lo    the chart's leading edge, in screen pixels
+         * @param size  its scaled extent on this axis
+         * @param box   the viewport's extent on this axis
+         * @returns how far to move the view on this axis; 0 when it is fine
+         */
+        const rescue = (lo: number, size: number, box: number): number => {
+            const need = Math.min(KEEP, size, box);
+            if (lo + size < need) return need - (lo + size);   // ran off the near edge
+            if (lo > box - need) return (box - need) - lo;     // ran off the far edge
+            return 0;
+        };
+        const dx = rescue(b.minX * t.k + t.tx, (b.maxX - b.minX) * t.k, this.lastFit.width);
+        const dy = rescue(b.minY * t.k + t.ty, (b.maxY - b.minY) * t.k, this.lastFit.height);
+        if (dx === 0 && dy === 0) return;
+        this.zoom.apply({ k: t.k, tx: t.tx + dx, ty: t.ty + dy });
+        // Still the reader's view, not the fit's: the next update must keep it.
+        this.zoom.markTouched();
     }
 
     /**
@@ -2651,6 +2914,7 @@ export class Visual implements IVisual {
     public destroy(): void {
         this.destroyed = true;
         this.finishAfterPhotos = null;
+        if (this.viewSaveTimer !== null) { clearTimeout(this.viewSaveTimer); this.viewSaveTimer = null; }
         try {
             window.removeEventListener("beforeprint", this.onBeforePrint);
             window.removeEventListener("afterprint", this.onAfterPrint);

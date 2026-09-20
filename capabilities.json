@@ -885,6 +885,15 @@
           }
         }
       }
+    },
+    "viewState": {
+      "properties": {
+        "data": {
+          "type": {
+            "text": true
+          }
+        }
+      }
     }
   },
   "supportsHighlight": false,
