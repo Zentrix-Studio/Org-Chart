@@ -28,6 +28,7 @@ import {
     buildHierarchy, hiddenByCollapse, isParentNode,
     serializeCollapsed, deserializeCollapsed, Hierarchy,
 } from "./model/hierarchy";
+import { applyDrawBudget, DrawBudget, MAX_DRAWN_CARDS } from "./model/drawBudget";
 import {
     treeLayout, fitAvoiding, cardRects, rootsBox, LayoutResult, LayoutOptions, ScreenRect,
 } from "./model/treeLayout";
@@ -294,6 +295,14 @@ export class Visual implements IVisual {
 
     /** Collapsed node KEYS (not indices) — survives refresh and cross-filter. */
     private collapsedKeys = new Set<string>();
+    /**
+     * The branch the draw budget serves first (1180.2.4): the card a reader
+     * last opened, or the person search jumped to. A KEY, like collapse, so a
+     * refresh keeps it. Session-local — it is where the reader is, not a setting.
+     */
+    private budgetFocusKey: string | null = null;
+    /** The last render's draw budget — what was cut, and which cards it folded. */
+    private lastBudget: DrawBudget | null = null;
     /** The stored collapse value as last read from the host; null before the first. */
     private lastHostCollapsed: string | null = null;
 
@@ -792,7 +801,20 @@ export class Visual implements IVisual {
             for (let i = 0; i < keys.length; i++) {
                 if (this.collapsedKeys.has(keys[i]) && isParentNode(hierarchy, i)) collapsed.add(i);
             }
-            const hidden = hiddenByCollapse(hierarchy, collapsed);
+            /*
+             * The draw budget (1180.2.4). Collapse decides what a reader ASKED to
+             * see; the budget decides how much of that is painted at once. A
+             * forest of 100,005 roots cannot be folded — collapse stops at the
+             * roots — so without this every one of them became an SVG card and
+             * the visual stopped responding. Every stage below lays out and
+             * draws from the budgeted set, so none of them pays for the rest.
+             */
+            const focusIdx = this.budgetFocusKey === null ? -1 : keys.indexOf(this.budgetFocusKey);
+            const budget = applyDrawBudget(
+                hierarchy, hiddenByCollapse(hierarchy, collapsed), MAX_DRAWN_CARDS, focusIdx,
+            );
+            this.lastBudget = budget;
+            const hidden = budget.hidden;
             // Leaf stacking and forest wrapping for what is actually on screen.
             Object.assign(layoutOptions, arrange(hidden));
 
@@ -1015,7 +1037,9 @@ export class Visual implements IVisual {
                 accentBar: this.settings.colors.accentBar.value,
                 surface,
                 colorOf: ruleColorOf,
-                collapsed,
+                // A manager whose reports were all past the budget draws as
+                // folded, with its true count — not as a leaf with an open toggle.
+                collapsed: budget.folded.size ? new Set([...collapsed, ...budget.folded]) : collapsed,
                 // The span numbers the "Show span metrics" control promises
                 // on the card. `metrics` is already null unless the licence allows
                 // orgAnalytics, so this needs no second gate (OC-QA-16 / OC-015).
@@ -1040,7 +1064,8 @@ export class Visual implements IVisual {
             });
 
             this.bindInteraction(keys, model, hierarchy, hidden, metrics, palette, ruleColorOf);
-            this.renderStatus(model, hierarchy, w, h, surface.muted, summary, changeOf);
+            this.renderStatus(model, hierarchy, w, h, surface.muted, summary, changeOf,
+                model.nodes.length - hidden.size, budget.cut);
 
             // Legend — drawn after the status line, which clears `chrome`, and
             // above it so the two never share a row.
@@ -1252,8 +1277,13 @@ export class Visual implements IVisual {
             select(this).select("g.card-toggle").on("click", (ev: MouseEvent) => {
                 ev.stopPropagation();
                 const key = keys[i];
-                if (self.collapsedKeys.has(key)) self.collapsedKeys.delete(key);
-                else self.collapsedKeys.add(key);
+                const budgetFolded = !!self.lastBudget && self.lastBudget.folded.has(i);
+                if (budgetFolded || self.collapsedKeys.has(key)) {
+                    // Opening a branch: it goes first in the draw budget, so the
+                    // reports the reader asked for are the ones painted.
+                    self.collapsedKeys.delete(key);
+                    self.budgetFocusKey = key;
+                } else self.collapsedKeys.add(key);
                 self.persistCollapsed(keys);
                 if (self.lastOptions) self.update(self.lastOptions);
             });
@@ -1721,8 +1751,10 @@ export class Visual implements IVisual {
      *
      * The categorical window is 30,000 rows; a large org exceeds that. Segments
      * accumulate (`aggregateSegments = true`) so each update carries everything
-     * fetched so far. Only worth doing when the tier is uncapped — the free tier
-     * renders 500 people and would just burn the 100 MB budget.
+     * fetched so far. Since OC-016 every tier is uncapped, so this runs for
+     * everyone: a 100,005-row table arrives as four updates. That is only safe
+     * because the draw budget (`model/drawBudget.ts`, 1180.2.4) bounds what each
+     * of those updates paints — the model holds every row, the chart does not.
      *
      * Source: learn.microsoft.com/power-bi/developer/visuals/fetch-more-data
      */
@@ -1965,11 +1997,16 @@ export class Visual implements IVisual {
     /** Honest cap notice + the paid summary strip. Never a blank or error state. */
     private renderStatus(
         model: OrgModel, h: Hierarchy, w: number, vh: number, color: string,
-        summary?: OrgSummary | null, changeOf?: Map<string, ChangeKind> | null,
+        summary?: OrgSummary | null, changeOf?: Map<string, ChangeKind> | null, drawn = 0, cut = 0,
     ): void {
         this.chrome.selectAll("*").remove();
         const bits: string[] = [];
         if (model.capped) bits.push(this.loc.fmt("Status_Showing", model.nodes.length, model.totalRows));
+        // Said FIRST, because it is the one that changes what the reader sees.
+        if (cut > 0) {
+            const num = (v: number): string => { try { return v.toLocaleString(this.loc.locale); } catch { return String(v); } };
+            bits.push(this.loc.fmt("Status_DrawBudget", num(drawn), num(drawn + cut)));
+        }
         if (summary) {
             bits.push([
                 this.loc.fmt("Status_People", summary.people),
@@ -2463,8 +2500,16 @@ export class Visual implements IVisual {
         // A match can be inside a collapsed branch, where no card is drawn.
         // Centring on it would land the user on empty canvas, so open the way in
         // first — that is the difference between "search" and "search and jump".
-        if (this.revealAncestors(index) && !this.lastLayout) return;
-        if (index >= this.lastLayout.x.length) return;
+        // Past the draw budget the person may not be painted even with every
+        // manager open — so they go first in it, and the chart redraws round them.
+        const key = this.lastKeys[index];
+        if (key !== undefined) this.budgetFocusKey = key;
+        const opened = this.revealAncestors(index);
+        if (!opened && this.lastBudget && this.lastBudget.hidden.has(index) && this.lastOptions) {
+            this.update(this.lastOptions);
+        }
+        if (!this.lastLayout) return;
+        if (index >= this.lastLayout.x.length || !isFinite(this.lastLayout.x[index])) return;
         const t = this.zoom.current();
         const vp = this.lastOptions.viewport;
         // Search keeps the reader's scale. "Show on the chart" from the table asks

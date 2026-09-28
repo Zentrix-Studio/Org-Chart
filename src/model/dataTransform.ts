@@ -54,10 +54,25 @@ function valuesFor(vals: DataViewValueColumn[] | undefined, role: string): DataV
  */
 export function formatMeasure(value: number, locale?: string): string {
     try {
-        return new Intl.NumberFormat(locale || "en-US", { maximumFractionDigits: 2 }).format(value);
+        return measureFormat(locale || "en-US").format(value);
     } catch {
         return String(value);   // an unknown locale must never break the render
     }
+}
+
+/*
+ * One formatter per locale. Constructing an Intl.NumberFormat costs far more than
+ * using one, and this runs once per ROW: at 100,005 rows it was 844 ms of every
+ * update on its own (1180.2.4 profiling, 2026-09-28).
+ */
+const formats = new Map<string, Intl.NumberFormat>();
+function measureFormat(locale: string): Intl.NumberFormat {
+    let f = formats.get(locale);
+    if (!f) {
+        f = new Intl.NumberFormat(locale, { maximumFractionDigits: 2 });   // throws on a bad locale: not cached
+        formats.set(locale, f);
+    }
+    return f;
 }
 
 /** Find the first value column bound to `role`. */

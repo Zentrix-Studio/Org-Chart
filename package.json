@@ -1,7 +1,7 @@
 {
   "name": "zentrix-org-chart",
   "description": "Power BI custom visual — parent-child hierarchy / org chart with permissive roots and persistent collapse state.",
-  "version": "1.0.0.0",
+  "version": "1.0.0.1",
   "license": "MIT",
   "scripts": {
     "pbiviz": "pbiviz",

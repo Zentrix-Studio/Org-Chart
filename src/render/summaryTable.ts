@@ -25,6 +25,15 @@ const MONO = "'SF Mono', 'Cascadia Mono', Consolas, ui-monospace, monospace";
 const SERIF = "Georgia, 'Times New Roman', serif";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+/**
+ * Rows the table puts in the page at once (1180.2.4, 2026-09-28). A row is a
+ * <tr> and ~8 cells, so 100,005 people was ~900,000 elements and the view hung
+ * the same way the chart did. Search, the Group filter, sorting and the CSV all
+ * still run over EVERY row — only the painting stops here, and the last row says
+ * how many more match.
+ */
+export const MAX_TABLE_ROWS = 1000;
+
 /** The reader's table choices, persisted as one blob (`tableState.data`). */
 export interface TableState {
     columns: string[];
@@ -579,7 +588,9 @@ export function renderSummaryTable(
                 return (sortDesc ? -cmp : cmp) || a.treeOrder - b.treeOrder;
             });
 
-        countEl.textContent = `${shown.length.toLocaleString("en-US")} of ${rows.length.toLocaleString("en-US")} shown`;
+        countEl.textContent = shown.length > MAX_TABLE_ROWS
+            ? `first ${MAX_TABLE_ROWS.toLocaleString("en-US")} of ${shown.length.toLocaleString("en-US")} matching`
+            : `${shown.length.toLocaleString("en-US")} of ${rows.length.toLocaleString("en-US")} shown`;
         while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
 
         if (shown.length === 0) {
@@ -594,7 +605,7 @@ export function renderSummaryTable(
         }
 
         const tdBase = `padding:9px 14px;border-bottom:1px solid ${c.border};white-space:nowrap`;
-        shown.forEach((r, n) => {
+        shown.slice(0, MAX_TABLE_ROWS).forEach((r, n) => {
             const tr = document.createElement("tr");
             tr.className = "zx-sum-row";
             tr.setAttribute("data-index", String(r.index));
@@ -653,6 +664,17 @@ export function renderSummaryTable(
             }
             tbody.appendChild(tr);
         });
+        if (shown.length > MAX_TABLE_ROWS) {
+            const tr = document.createElement("tr");
+            tr.className = "zx-sum-more";
+            const td = document.createElement("td");
+            td.colSpan = vc.length + 1;
+            td.textContent = `${(shown.length - MAX_TABLE_ROWS).toLocaleString("en-US")} more not listed — ` +
+                "search or filter by group to narrow, or export the CSV for everyone.";
+            td.style.cssText = `padding:14px;text-align:center;font:12px ${fontFamily};color:${surface.muted}`;
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
     }
 
     renderHead();
