@@ -23,7 +23,7 @@ import {
     FIRST_LEVEL, LAST_LEVEL, levelLadder, levelsShown,
 } from "./interaction/settingsSchema";
 import { EmptyReason, OrgModel, Orientation, ConnectorStyle, ColorMode, TooltipStyle } from "./types";
-import { buildOrgModel, missingRequiredRole, boundRoles } from "./model/dataTransform";
+import { buildOrgModel, missingRequiredRole, boundRoles, formatMeasure } from "./model/dataTransform";
 import {
     buildHierarchy, hiddenByCollapse, isParentNode,
     serializeCollapsed, deserializeCollapsed, Hierarchy,
@@ -47,6 +47,7 @@ import {
     arrangeFor, FitScale, LeafMode, uniformLevelsShown,
 } from "./model/autoFit";
 import { renderTree, trimToWidth, smallestNameSize } from "./render/tree";
+import { formatCell, setFormatLocale, usableFormat } from "./render/format";
 import { renderLanding as renderLandingPage } from "./render/landing";
 import { PhotoShape, PhotoFallback } from "./render/tree";
 import { LandingPage } from "./interaction/landingPage";
@@ -581,6 +582,9 @@ export class Visual implements IVisual {
         if (!this.redrawing) this.events.renderingStarted(options);
         try {
             const dataView: DataView | undefined = options.dataViews && options.dataViews[0];
+            // The report locale for the bound fields' format strings (OC-049), set before
+            // the model is built — the badge text is formatted in the transform.
+            setFormatLocale(this.loc.locale);
             this.settings = this.formattingSettingsService.populateFormattingSettingsModel(
                 VisualFormattingSettingsModel, dataView,
             );
@@ -1194,10 +1198,13 @@ export class Visual implements IVisual {
             directReports: hierarchy.children[i].length,
             metrics: metrics ? metrics[i] : null,
             note: this.notes.get(model.nodes[i].key) || null,
+            // A Tooltips-well measure prints in ITS OWN format (OC-049); text stays raw.
             extra: model.tooltipColumns.map((c) => ({
                 displayName: c.displayName,
-                value: String(c.values[model.nodes[i].index] ?? ""),
+                value: formatCell(c.values[model.nodes[i].index], c.format, this.loc.locale),
             })),
+            // Branch totals in the Measure's own format (OC-049).
+            formatNumber: this.numberFormatter(model.measureFormat),
             /*
              * The swatch is the card's OWN colour (OC-042 — CEO: "tooltip color
              * not changing"). It was `groupColor(0)` for every person, so the
@@ -1581,7 +1588,7 @@ export class Visual implements IVisual {
         const changes = this.license.allows("temporal") ? this.periodChanges(model) : null;
         const hasMeasure = model.nodes.some((n) => n.measure !== null);
         const hasGroup = model.groups.length > 0;
-        const format = this.numberFormatter();
+        const format = this.numberFormatter(model.measureFormat);
 
         // Keep the rows the floating chrome sits in clear, so the gear and the
         // pill never cover the table's own search box or a headline.
@@ -1689,8 +1696,14 @@ export class Visual implements IVisual {
         } catch { /* focus is a courtesy; the jump already happened */ }
     }
 
-    /** Locale-aware numbers for totals the host did not format for us. */
-    private numberFormatter(): (v: number) => string {
+    /** Locale-aware numbers for totals the host did not format for us — in the Measure
+     *  field's own format when it has one (OC-049), so a branch total reads "$1,200.00"
+     *  beside a badge that does. */
+    private numberFormatter(format?: string | null): (v: number) => string {
+        if (usableFormat(format)) {
+            const locale = this.loc.locale;
+            return (v: number) => formatMeasure(v, locale, format);
+        }
         try {
             const nf = new Intl.NumberFormat(this.loc.locale || "en-US", { maximumFractionDigits: 2 });
             return (v: number) => nf.format(v);

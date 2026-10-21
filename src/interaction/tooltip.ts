@@ -40,6 +40,8 @@ export interface TooltipInput {
     extra?: Array<{ displayName: string; value: string }>;
     /** Accent used for the swatch shown beside the header. */
     color?: string;
+    /** Prints a branch total in the Measure's own format (OC-049); `String(v)` when absent. */
+    formatNumber?: (v: number) => string;
 }
 
 /**
@@ -74,7 +76,8 @@ export function buildTooltip(input: TooltipInput): VisualTooltipDataItem[] {
         if (m.span === "narrow") items.push({ displayName: "Span of control", value: "Narrow" });
         if (m.vacant) items.push({ displayName: "Status", value: "Vacant" });
         if (m.branchTotal !== null) {
-            items.push({ displayName: `${input.measureLabel || "Measure"} (branch)`, value: String(m.branchTotal) });
+            const total = input.formatNumber ? input.formatNumber(m.branchTotal) : String(m.branchTotal);
+            items.push({ displayName: `${input.measureLabel || "Measure"} (branch)`, value: total });
         }
     }
 

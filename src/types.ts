@@ -57,10 +57,16 @@ export interface OrgModel {
     hasHighlights: boolean;
     /** Caption of the bound measure column, for tooltips. */
     measureLabel: string | null;
+    /** The Measure field's Power BI format string (OC-049) — what "Format: Currency" on
+     *  the field sets — or null when unbound / unformatted / "General". Drives the badge,
+     *  tooltips, branch totals, the Table and the Insight view alike. */
+    measureFormat: string | null;
     /** Caption of the bound group column — the drilled level when drilling. */
     groupLabel: string | null;
-    /** Extra fields bound to the Tooltips role. */
-    tooltipColumns: Array<{ displayName: string; values: unknown[] }>;
+    /** Extra fields bound to the Tooltips role. `format` is each field's own Power BI
+     *  format string (OC-049): a Percentage prints "25.0%", never 0.25, and never in the
+     *  Measure's currency. */
+    tooltipColumns: Array<{ displayName: string; values: unknown[]; format?: string }>;
     /**
      * PAID (`temporal`). Per-row id / parent / period as bound, BEFORE the
      * de-duplication by key that `nodes` goes through.

@@ -6,6 +6,7 @@
  */
 
 import powerbi from "powerbi-visuals-api";
+import { formatWithFieldFormat, usableFormat } from "../render/format";
 import DataView = powerbi.DataView;
 import DataViewCategoryColumn = powerbi.DataViewCategoryColumn;
 import DataViewValueColumn = powerbi.DataViewValueColumn;
@@ -51,8 +52,13 @@ function valuesFor(vals: DataViewValueColumn[] | undefined, role: string): DataV
 /**
  * Locale-aware number formatting for the measure badge and tooltip.
  * Uses the host locale so 1234.5 reads as "1,234.5" or "1.234,5" correctly.
+ * With the field's Power BI format string (OC-049) the symbol / percent / fixed
+ * places come from the field ("$1,234.50"); without one — or with "General" — the
+ * output is byte-identical to before.
  */
-export function formatMeasure(value: number, locale?: string): string {
+export function formatMeasure(value: number, locale?: string, format?: string | null): string {
+    const formatted = formatWithFieldFormat(value, format, 1, undefined, locale);
+    if (formatted != null) return formatted;
     try {
         return measureFormat(locale || "en-US").format(value);
     } catch {
@@ -150,7 +156,7 @@ export function buildOrgModel(
     const empty: OrgModel = {
         nodes: [], groups: [], capped: false, totalRows: 0, duplicateRows: 0, keylessRows: 0,
         hasSecondaryParent: false, hasPeriod: false, hasHighlights: false,
-        measureLabel: null, groupLabel: null, tooltipColumns: [],
+        measureLabel: null, measureFormat: null, groupLabel: null, tooltipColumns: [],
         periodRows: { keys: [], parents: [], periods: [] },
     };
     const cats = dataView?.categorical?.categories as DataViewCategoryColumn[] | undefined;
@@ -170,6 +176,8 @@ export function buildOrgModel(
     const vals = dataView?.categorical?.values as unknown as DataViewValueColumn[] | undefined;
     const measureCol = valueFor(vals, "measure");
     const tooltipCols = valuesFor(vals, "tooltips");
+    // OC-049: the Measure field's own format string, read once per update.
+    const measureFormat = usableFormat(measureCol?.source?.format);
     // The host sends `highlights` when another visual cross-filters this one:
     // a parallel array where non-highlighted rows are null.
     const highlights = (measureCol as unknown as { highlights?: unknown[] })?.highlights
@@ -221,7 +229,7 @@ export function buildOrgModel(
             photo: photoCol ? safeImageDataUri(photoCol.values[i]) : null,
             group,
             measure,
-            measureText: measure === null ? null : formatMeasure(measure, locale),
+            measureText: measure === null ? null : formatMeasure(measure, locale, measureFormat),
             highlighted: hasHighlights
                 ? (highlights as unknown[])[i] !== null && (highlights as unknown[])[i] !== undefined
                 : true,
@@ -237,10 +245,13 @@ export function buildOrgModel(
         hasPeriod: !!periodCol,
         hasHighlights,
         measureLabel: measureCol?.source?.displayName ?? null,
+        measureFormat,
         groupLabel: groupCol?.source?.displayName ?? null,
         tooltipColumns: tooltipCols.map((c) => ({
             displayName: c.source?.displayName ?? "",
             values: (c.values as unknown[]) || [],
+            // Only present when the field has one, so an unformatted column's shape is unchanged.
+            format: usableFormat(c.source?.format) ?? undefined,
         })),
         periodRows,
     };
