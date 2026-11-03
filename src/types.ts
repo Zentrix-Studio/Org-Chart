@@ -26,6 +26,10 @@ export interface OrgNode {
     measure: number | null;
     /** Formatted measure for display, or null. Locale-aware. */
     measureText: string | null;
+    /** OC-051: the same value in compact form ("$125K", "125K") for a card badge too narrow
+     *  for `measureText`; null when unbound, absent on nodes built before OC-051 (treated as
+     *  "no compact form"). Tooltips, Table and Insight keep the full text. */
+    measureCompact?: string | null;
     /** False only when the host is highlighting and this row is not in it. */
     highlighted: boolean;
     /** Power BI selection identity for cross-filtering. Null outside a host

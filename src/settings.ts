@@ -503,6 +503,14 @@ class ToolbarCard extends FormattingSettingsCard {
     actions = new formattingSettings.ToggleSwitch({
         name: "actions", displayName: "Quick actions (zoom, lens)", value: true,
     });
+    /**
+     * OC-048 — fade the on-canvas chrome (gear, view switch, quick-action bar, search
+     * box) while the cursor is outside the visual. The family's `toolbar.autoHide`
+     * (HM-V2-41, Calendar Heatmap). Default on, as there.
+     */
+    autoHide = new formattingSettings.ToggleSwitch({
+        name: "autoHide", displayName: "Auto disappear", value: true,
+    });
     actionsPosition = new formattingSettings.ItemDropdown({
         name: "actionsPosition", displayName: "Quick actions position",
         items: [
@@ -523,7 +531,7 @@ class ToolbarCard extends FormattingSettingsCard {
     displayName = "Toolbar";
     slices: FormattingSettingsSlice[] = [
         this.show, this.position, this.closeOnClickAway,
-        this.actions, this.actionsPosition, this.lens,
+        this.actions, this.autoHide, this.actionsPosition, this.lens,
     ];
 }
 

@@ -819,6 +819,12 @@
             "bool": true
           }
         },
+        "autoHide": {
+          "displayName": "Auto disappear",
+          "type": {
+            "bool": true
+          }
+        },
         "actionsPosition": {
           "displayName": "Quick actions position",
           "type": {

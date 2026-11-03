@@ -72,6 +72,7 @@ import { serializeSvg, rasterizeToPng, safeFileName } from "./render/exportImage
 import { renderDottedLines } from "./render/tree";
 import { accent, accentStrong, posSafe, negSafe, fontFamily, Surface } from "./theme/zentrixTokens";
 import { ViewToggle, ViewKind, PILL_HEIGHT } from "./interaction/viewToggle";
+import { ChromeAutoHide } from "./interaction/chromeAutoHide";
 import { renderSummaryTable, TableState } from "./render/summaryTable";
 import { renderInsightView } from "./render/insightView";
 import { computeOrgNarrative, InsightAction } from "./insights/orgInsights";
@@ -340,6 +341,8 @@ export class Visual implements IVisual {
      * report READER, where a persistProperties write does not survive. Only the
      * table's column / sort / folded-cards choices persist (`tableState`). */
     private viewToggle: ViewToggle | null = null;
+    /** Auto disappear (OC-048): fades the gear, pill, action bar and search box off-pointer. */
+    private chromeAutoHide: ChromeAutoHide;
     private viewMode: ViewKind = "chart";
     /** The mounted Table or Insight surface, when one is showing. */
     private altEl: HTMLElement | null = null;
@@ -481,6 +484,16 @@ export class Visual implements IVisual {
             });
         }
 
+        // Auto disappear (OC-048, family HM-V2-41, QA-STANDARD §21): the gear, the view
+        // switch, the quick-action bar and the search box show only while the pointer is
+        // inside the visual. Bound to `options.element` — the whole tile, not `.zentrix-org-root`
+        // — so a pointer anywhere over the visual counts as inside. Leaving closes an open
+        // settings panel first (§21 step 2) and drops a hover card the pointer left behind.
+        this.chromeAutoHide = new ChromeAutoHide(options.element, () => {
+            if (this.overlay && this.overlay.isOpen()) this.overlay.forceClose();
+            if (this.overlayTooltip) this.overlayTooltip.hide();
+        });
+
         // The onboarding carousel. Mounted HERE, not from update(): Power BI does
         // not call update() until a role is bound, so a page shown only from there
         // would never appear on the empty visual it exists for. update() takes it
@@ -592,6 +605,12 @@ export class Visual implements IVisual {
             // The gear's own edits, and then the colours the host refuses to keep.
             // Both have to land BEFORE anything is drawn from these settings.
             if (this.overlay) this.overlay.reconcile(this.settings);
+            // Auto disappear follows the (reconciled) setting on every pass. A gear edit
+            // re-enters update() through the overlay's onChange, so this one call is both
+            // the host path and the settings re-render path; before any early return, so
+            // the switch applies on a canvas with nothing drawn yet.
+            this.chromeAutoHide.setEnabled(Boolean(this.settings.toolbar.autoHide.value));
+            this.chromeAutoHide.sync();
             this.hydrateColors(dataView);
             this.hydrateTableState(dataView);
 

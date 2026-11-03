@@ -386,10 +386,26 @@ export function renderTree(
     // band has to stop at its left edge, not at the card edge — budgeting against
     // the card width is what let a job title run under the badge on a third of
     // the cards at default settings (OC-QA-05, OC-QA-07).
-    const badgeWidth = (i: number): number => {
-        const t = nodes[i].measureText || "";
-        return Math.max(26 * scale(i), t.length * titleSize(i) * 0.62 + 12 * scale(i));
+    const pillWidth = (i: number, t: string): number =>
+        Math.max(26 * scale(i), t.length * titleSize(i) * 0.62 + 12 * scale(i));
+    /** Does a badge carrying `t` still leave the name its room? */
+    const pillFits = (i: number, t: string): boolean =>
+        W(i) - pillWidth(i, t) - 8 * scale(i) - textLeft(i) >= nameSize(i) * 2;
+    /**
+     * OC-051: the text the badge actually carries. The full formatted value when it fits;
+     * otherwise the compact form ("$125K" — the field's own format under Auto display
+     * units, OC-049); null only when even that cannot fit. Before this, a Currency-formatted
+     * Measure ("$125,000.50" — always longer than the plain number) dropped the badge on
+     * nearly every card, so setting a format made the numbers vanish from the chart.
+     */
+    const badgeText = (i: number): string | null => {
+        const full = nodes[i].measureText;
+        if (!opts.showMeasure || !full) return null;
+        if (pillFits(i, full)) return full;
+        const compact = nodes[i].measureCompact;
+        return compact && compact !== full && pillFits(i, compact) ? compact : null;
     };
+    const badgeWidth = (i: number): number => pillWidth(i, badgeText(i) ?? nodes[i].measureText ?? "");
     const badgeLeft = (i: number): number => W(i) - badgeWidth(i) - 8 * scale(i);
     /**
      * A long measure on a narrow card can want the whole card. Reserving that
@@ -397,9 +413,7 @@ export function renderTree(
      * across both text lines. The name is what the card is for, so past this
      * point the badge is dropped instead — widen the card, or turn the badge off.
      */
-    const badgeShown = (i: number): boolean => opts.showMeasure
-        && !!nodes[i].measureText
-        && badgeLeft(i) - textLeft(i) >= nameSize(i) * 2;
+    const badgeShown = (i: number): boolean => badgeText(i) !== null;
 
     // Span-of-control pill, top-right — the opposite corner from the measure
     // badge, so the two never compete for the same space.
@@ -628,8 +642,8 @@ export function renderTree(
     badge.selectAll("*").remove();
     if (opts.showMeasure) {
         badge.each(function (i) {
-            const text = nodes[i].measureText;
-            if (!badgeShown(i)) return;
+            const text = badgeText(i);
+            if (text === null) return;
             const sel = (this as SVGGElement);
             const ts = titleSize(i);
             const w = badgeWidth(i);

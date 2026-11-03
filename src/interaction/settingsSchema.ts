@@ -256,6 +256,7 @@ const KEYS: Record<string, Entry> = {
     "toolbar.closeOnClickAway": bool("toolbar", "closeOnClickAway", (m) => m.toolbar.closeOnClickAway),
     // The quick-action bar and the lens (OC-034).
     "toolbar.actions": bool("toolbar", "actions", (m) => m.toolbar.actions),
+    "toolbar.autoHide": bool("toolbar", "autoHide", (m) => m.toolbar.autoHide),
     "toolbar.actionsPosition": dropdown("toolbar", "actionsPosition", (m) => m.toolbar.actionsPosition),
     "toolbar.lens": bool("toolbar", "lens", (m) => m.toolbar.lens),
     "branding.showBranding": bool("branding", "showBranding", (m) => m.branding.showBranding),
@@ -639,6 +640,10 @@ export function makeCats(shape: DataShape): SBCategory[] {
                             opt("tl", "Top left"), opt("tr", "Top right"), opt("br", "Bottom right")],
                     },
                     { control: "switch", label: "Close on click-away", key: "toolbar.closeOnClickAway" },
+                    {
+                        control: "switch", label: "Auto disappear", key: "toolbar.autoHide",
+                        info: "When on, the controls that sit on the chart — this settings gear, the Chart / Table / Insight switch, the zoom / fit / lens buttons and the Search people box — fade away as soon as the cursor moves out of the visual, and come back the moment it returns. Moving away also closes this panel; changes you already made are kept. Tabbing into the visual with the keyboard shows them too. On a touch screen, tap the visual to show them and tap elsewhere to hide them. Turn it off to keep them on screen all the time.",
+                    },
                     { control: "divider" },
                     {
                         control: "switch", label: "Zentrix branding", key: "branding.showBranding",

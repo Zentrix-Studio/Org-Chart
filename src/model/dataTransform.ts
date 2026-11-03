@@ -66,6 +66,29 @@ export function formatMeasure(value: number, locale?: string, format?: string | 
     }
 }
 
+/**
+ * OC-051 — the measure in compact form for a card badge that has no room for the full text.
+ * With a field format it stays in that format with Auto-style display units ("$125K",
+ * "$1.3M", one decimal under 10 units); without one it uses the locale's compact notation
+ * ("125K"). Percentages and values under 1,000 are already short and come back unchanged.
+ */
+export function formatMeasureCompact(value: number, locale?: string, format?: string | null): string {
+    const abs = Math.abs(value);
+    const fmt = usableFormat(format);
+    if (abs < 1000 || (fmt && fmt.includes("%"))) return formatMeasure(value, locale, format);
+    const scale = abs >= 1e9 ? 1e9 : abs >= 1e6 ? 1e6 : 1e3;
+    const precision = abs / scale < 10 ? 1 : 0;
+    if (fmt) {
+        const t = formatWithFieldFormat(value, fmt, scale, precision, locale);
+        if (t != null) return t;
+    }
+    try {
+        return new Intl.NumberFormat(locale || "en-US", { notation: "compact", maximumFractionDigits: precision }).format(value);
+    } catch {
+        return formatMeasure(value, locale, format);
+    }
+}
+
 /*
  * One formatter per locale. Constructing an Intl.NumberFormat costs far more than
  * using one, and this runs once per ROW: at 100,005 rows it was 844 ms of every
@@ -230,6 +253,7 @@ export function buildOrgModel(
             group,
             measure,
             measureText: measure === null ? null : formatMeasure(measure, locale, measureFormat),
+            measureCompact: measure === null ? null : formatMeasureCompact(measure, locale, measureFormat),
             highlighted: hasHighlights
                 ? (highlights as unknown[])[i] !== null && (highlights as unknown[])[i] !== undefined
                 : true,
